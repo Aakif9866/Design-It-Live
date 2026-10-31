@@ -1,0 +1,164 @@
+## The problem
+
+It is 7:40 on a Tuesday evening in Kukatpally, Hyderabad. Ravi runs Sri Lakshmi Kirana, a shop about the size of a large bedroom, and his phone has not stopped buzzing for forty minutes. Twelve unread WhatsApp chats. Most are voice notes. One is from an aunty three streets away: *"bhaiya 2 kilo atta aur ek Surf Excel bhej do, aur woh chhota wala Parle-G bhi"*. Another is in Telugu. Another is a photo of a handwritten list. Ravi is weighing dal for a customer at the counter, and every minute he does not reply, someone orders from the quick-commerce app instead.
+
+Ravi does not need a new app. His customers already use WhatsApp, and they are not going to install anything. What he needs is an assistant that listens to those voice notes, works out what people want, checks whether he has it, builds the order, asks the customer to confirm, sends a UPI (Unified Payments Interface) payment link, and pings his phone when it is paid.
+
+That assistant is **DukaanVoice**, and for the next two days you are going to design it. Not a toy version. You will take it from 20 shops in one city to 50,000 shops across India, through a Diwali night when traffic is ten times normal, while keeping the AI bill per order smaller than the price of a toffee.
+
+## How this course works
+
+This is a reading course. There is nothing to install and no exercises to submit. You will see short TypeScript snippets, but only to make an idea concrete; you never need to run them. Plan for about **6.5 hours of reading**, split across Saturday and Sunday.
+
+You already know a lot of what system design is built on. You have written Express servers, modelled data in MongoDB, built React apps and used Git every day. You have solved enough algorithm problems to know what an index or a hash map buys you. System design is mostly about what happens when those pieces meet the real world: more users than one machine can handle, networks that fail, third-party services that are slow, and data that has to stay correct while all of that is going on.
+
+So the course does not re-teach the basics. It assumes you know what a REST endpoint is, and asks instead what happens when a two-year-old version of your mobile app calls it.
+
+Every lesson has the same shape, so you always know where you are:
+
+1. **The problem.** What just broke at DukaanVoice, or what it needs next.
+2. **The concepts.** The ideas, in plain English, built on what you already know.
+3. **Diagrams** drawn like blueprints, showing how the architecture changed.
+4. **Code snippets** in TypeScript, 5 to 30 lines, only where they make an idea concrete.
+5. **Decision cards.** "Choose A when, choose B when", the trade-off, and what DukaanVoice picks. All of them are collected on the [cheat sheet](/cheatsheet).
+6. **Interview angle.** How the topic comes up in SDE interviews and the mistake to avoid.
+7. **Key takeaways** and a **three-question quiz** with explanations.
+
+Each lesson ends with a "Mark as done" button. Your progress is saved in this browser, and the sidebar and home page show where you left off.
+
+## The weekend plan
+
+The [weekend plan](/plan) has exact times and breaks, but here is the shape:
+
+| When | What | Time |
+| --- | --- | --- |
+| Saturday morning | Part A: foundations, lessons 1 to 7 | about 2 h 10 min |
+| Saturday afternoon | Part B begins: LLMs, voice, the gateway, lessons 8 to 10 | about 1 h 5 min |
+| Sunday morning | Part B continues: tools, RAG, agents, evals, safety, cost, lessons 11 to 17 | about 2 h 20 min |
+| Sunday afternoon | Part C: scale, mobile, shipping and the interview playbook, lessons 18 to 20 | about 1 h |
+
+About 60% of the time is on AI system design: how products built on large language models (LLMs) are engineered in production, with real concerns like latency, cost, reliability and safety. The rest is the core distributed-systems knowledge every software engineer is expected to have. They are not separate subjects. An AI product is a normal distributed system with one very unusual dependency in the middle, and most of the hard problems are the normal ones.
+
+## Meet DukaanVoice
+
+Here is what the product does, end to end:
+
+- A customer sends a **WhatsApp voice note or text** in Telugu, Hindi, English or a mix of all three. Mixed-language speech, like "do kilo atta and one Surf Excel pampandi", is the normal case here, not the edge case.
+- DukaanVoice **transcribes** the audio, **understands** the request, **matches** items against that shop's catalog, **checks stock**, and replies with an order summary for the customer to **confirm**.
+- After confirmation it sends a **UPI payment link**, reserves the stock, and **notifies the shopkeeper** on a React Native mobile app and a Next.js web dashboard.
+- The shopkeeper can ask the assistant questions like "what sold most this week?" or "which items are running low?"
+
+And here is the pressure it lives under, which will drive almost every decision you make:
+
+- **Festival spikes.** Diwali, Eid and Sankranti bring several times normal traffic in a few evenings.
+- **Bad networks.** Small-town shopkeepers are often on patchy mobile data. The app has to work offline.
+- **Thin margins.** Shops pay about ₹1,499 a month. If the AI costs more than about 25 paise per order, the business does not work.
+- **Many shops, one platform.** Every shop's data, prices and customers must be strictly separated. This is called multi-tenancy.
+- **Money.** A customer must never be charged twice, and a shop must never sell stock it does not have.
+- **Privacy law.** India's Digital Personal Data Protection Act (DPDP Act) governs what you collect, why, and for how long.
+
+<Diagram
+  fig="1.1"
+  caption="Where you will end up on Sunday night. Every box here gets its own lesson."
+  label="Simplified DukaanVoice end-state architecture: WhatsApp and the payment gateway send webhooks to an ingest service, which puts jobs on a queue. Workers run the voice pipeline through an LLM gateway to model providers, and use Postgres, Redis and a vector index. The shopkeeper app and dashboard talk to the API."
+  chart={`flowchart TD
+  C["Customer on WhatsApp"] -->|voice note| WA["WhatsApp Cloud API"]
+  WA -->|webhook| IN["Ingest service"]
+  PG["Payment gateway"] -->|webhook| IN
+  IN --> Q[("Job queue")]
+  Q --> W["Order workers"]
+  W --> STT["Speech-to-text"]
+  W --> GW["LLM gateway"]
+  GW --> P1["Model provider A"]
+  GW --> P2["Model provider B"]
+  W --> DB[("Postgres: orders, stock")]
+  W --> VX[("Catalog search index")]
+  W --> R[("Redis: cache, limits")]
+  API["App API"] --> DB
+  S["Shopkeeper app and dashboard"] --> API
+`}
+/>
+
+Do not try to understand that diagram yet. On Saturday morning, DukaanVoice is a single Node.js server and one database, and that is the right design for 20 shops. Each box above appears only when the product hits a problem that needs it. That is the most important habit this course teaches: **add a component when a specific problem demands it, and be able to name that problem.**
+
+## The DukaanVoice timeline
+
+The story moves through five stages. The numbers stay consistent across every lesson, so you can check the maths as you go:
+
+| Stage | Shops | Orders per day | Lessons |
+| --- | --- | --- | --- |
+| Pilot | 20 in Hyderabad | about 600 | 1 to 4 |
+| Early growth | 500 | about 15,000 | 5 and 6 |
+| Regional | 2,000 across Telangana and Andhra Pradesh | about 60,000 | 7 to 12 |
+| Scale-up | 10,000 | about 300,000 | 13 to 17 |
+| Year two | 50,000 across India | about 2,000,000 | 18 to 20 |
+
+An average shop takes about 40 orders a day. Hold onto that number; lesson 2 turns it into servers, storage and a monthly AI bill.
+
+<Decision id="read-order" />
+
+## Interview angle
+
+<Interview
+  ask="Design a WhatsApp ordering assistant for small shops."
+  mistake="Drawing the final, fully scaled architecture in the first five minutes. Interviewers read that as pattern-matching, not design. Start simple and add components as the requirements and numbers demand them."
+>
+
+- You ask clarifying questions before drawing anything: who the users are, how many, what must never go wrong.
+- You start with the simplest design that works and explain what will break first as it grows.
+- You can tie every component to a requirement or a number: "we need a queue because the speech-to-text step takes three seconds and the webhook must answer in one".
+
+</Interview>
+
+This course follows exactly that path. By lesson 20 you will have rehearsed it twenty times on the same product.
+
+## Key takeaways
+
+<Takeaways>
+
+- DukaanVoice is one product followed for the whole weekend: a WhatsApp voice-ordering assistant for Indian local shops.
+- The constraints (festival spikes, bad networks, tiny margins, many tenants, money, privacy law) drive the design more than the features do.
+- Good designs grow: start boring, and add each component only when you can name the problem it solves.
+- AI system design is ordinary distributed-systems engineering around one slow, expensive, unpredictable dependency.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "On day one of the pilot, with 20 shops, what should DukaanVoice's architecture look like?",
+      options: [
+        "The full end-state diagram, so you never have to re-architect later",
+        "One server and one database, adding components only when a specific problem appears",
+        "Microservices from the start, one per feature, so teams can scale independently",
+        "A serverless function per WhatsApp message with no database, to keep costs at zero",
+      ],
+      answer: "B",
+      why: "Each component adds cost and failure modes. At 20 shops a single server and database is easier to change and debug. You add queues, caches and gateways when a named problem demands them, which is also what interviewers want to hear.",
+    },
+    {
+      q: "Which of these is the strongest driver of DukaanVoice's design decisions?",
+      options: [
+        "The number of features on the product roadmap",
+        "Which LLM provider is currently the most popular",
+        "The programming language the team prefers",
+        "Non-functional constraints such as festival spikes, cost per order, multi-tenancy and payment safety",
+      ],
+      answer: "D",
+      why: "Features tell you what to build; constraints tell you how. Spikes force queues and autoscaling, margins force model routing and caching, and payments force idempotency. The language and provider are much smaller choices.",
+    },
+    {
+      q: "Why is mixed-language input such as “do kilo atta and one Surf Excel pampandi” important to plan for?",
+      options: [
+        "It is the normal case for many DukaanVoice customers, so the speech and matching pipeline must handle it by default",
+        "It only appears in rare edge cases that can be routed to a human",
+        "It means DukaanVoice must run a separate pipeline for each language",
+        "It only matters for text messages, because voice notes are always single-language",
+      ],
+      answer: "A",
+      why: "Code-mixing is everyday speech in much of India. Treating it as an edge case would fail most real orders. Lesson 9 covers how the voice pipeline handles it without splitting into per-language pipelines.",
+    },
+  ]}
+/>
