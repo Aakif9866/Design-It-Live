@@ -4,7 +4,7 @@ Five hundred shops, and the evenings are getting slow. Between 7 and 9 pm the Po
 
 Farhan looks at the slow query log and finds the culprits are not the writes at all. They are reads, the same ones over and over:
 
-- Every voice note loads the shop's **entire catalog** (about 2,000 products) so the LLM can match items. Ravi's shop gets 60 voice notes an hour; that is 60 identical catalog loads.
+- Every voice note loads the shop's **entire catalog** (about 2,000 products) so the item matcher can look up what the customer asked for. Ravi's shop gets about 60 voice notes a day, most of them between 6 and 9 pm; that is 60 identical catalog loads, and across 500 shops about 30,000.
 - Every dashboard tab **polls** "today's summary" (orders, revenue, top items) every 10 seconds. Five hundred shopkeepers, some with two tabs open, recompute the same aggregates thousands of times an hour.
 - The shop settings (name, hours, delivery radius, language) are read on every single request.
 
