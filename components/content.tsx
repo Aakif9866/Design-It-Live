@@ -1,4 +1,6 @@
+import Link from "next/link";
 import type { ReactNode } from "react";
+import { getLesson } from "@/lib/course";
 import { DECISIONS } from "@/lib/decisions";
 import { inline } from "./inline";
 
@@ -63,5 +65,34 @@ export function Callout({ title, kind = "note", children }: { title?: string; ki
       {title && <p className="callout-title">{title}</p>}
       {children}
     </aside>
+  );
+}
+
+// One-line recap of every decision card, grouped by lesson. Rendered from the same data as the cheat sheet.
+export function DecisionRecap() {
+  return (
+    <div className="table-wrap" tabIndex={0} role="region" aria-label="Decision recap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Decision</th>
+            <th scope="col">DukaanVoice default</th>
+          </tr>
+        </thead>
+        <tbody>
+          {DECISIONS.map((d) => {
+            const lesson = getLesson(d.lesson);
+            return (
+              <tr key={d.id}>
+                <td>
+                  {d.title} {lesson && <Link href={`/lessons/${lesson.slug}`}>(lesson {lesson.order})</Link>}
+                </td>
+                <td>{inline(d.pick)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }

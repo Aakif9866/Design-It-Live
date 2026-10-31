@@ -72,6 +72,7 @@ export function Diagram({ chart, fig, caption, label }: { chart: string; fig: st
   const ref = useRef<HTMLDivElement>(null);
   const baseId = useId().replace(/[^a-zA-Z0-9]/g, "");
   const [error, setError] = useState<string | null>(null);
+  const [wide, setWide] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -92,7 +93,14 @@ export function Diagram({ chart, fig, caption, label }: { chart: string; fig: st
       });
       try {
         const { svg } = await mermaid.render(`mmd-${baseId}-${renderCount++}`, chart.trim());
-        if (!cancelled && ref.current) ref.current.innerHTML = svg;
+        if (!cancelled && ref.current) {
+          ref.current.innerHTML = svg;
+          // Keep labels readable on phones: never shrink below the natural width (capped), scroll instead.
+          const el = ref.current.querySelector("svg");
+          const natural = el?.viewBox.baseVal?.width ?? 0;
+          if (el && natural) el.style.minWidth = `${Math.min(natural, 560)}px`;
+          setWide(Math.min(natural, 560) > ref.current.clientWidth + 4);
+        }
       } catch (e) {
         console.error(`Diagram ${fig} failed`, e);
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -121,6 +129,7 @@ export function Diagram({ chart, fig, caption, label }: { chart: string; fig: st
       </div>
       <figcaption>
         <span className="diagram-fig">Fig {fig}</span> {caption}
+        {wide && <span className="diagram-hint"> Scroll sideways to see all of it.</span>}
       </figcaption>
     </figure>
   );

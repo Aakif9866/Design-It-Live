@@ -1,3 +1,262 @@
 ## The problem
 
-Coming soon.
+Year two. DukaanVoice serves 50,000 shops across India and handles about 2 million orders on an ordinary day. Diwali is six weeks away.
+
+Last Diwali, with 2,000 shops, things went badly between 7 and 9 pm. The voice queue grew to 40,000 jobs and replies took twelve minutes. Postgres ran out of connections. The LLM provider returned `429`s for an hour. Shopkeepers, refreshing their dashboards every few seconds to see what was happening, made the database load worse. Some customers gave up and called the shop, which is exactly the experience DukaanVoice exists to replace.
+
+This year the numbers are 25 times bigger. Lesson 2 estimated the Diwali evening peak at about **1,000 inbound messages per second**, about 4,000 voice notes in flight at once, and about **39 million LLM tokens per minute**. This lesson is the plan for that night, and it brings together almost everything in the course.
+
+## Spikes, and why autoscaling is not enough
+
+**Horizontal scaling** means adding more machines rather than bigger ones. DukaanVoice's API and workers are **stateless**: they keep nothing important in memory between requests (sessions are in Redis, jobs in the queue, data in Postgres), so you can run 5 or 500 copies. **Autoscaling** adds and removes copies automatically based on a metric.
+
+Two lessons from last year about autoscaling:
+
+- **Scale on the right metric.** The API scales on CPU and request latency. Workers must scale on **queue age** (how long the oldest job has been waiting) or depth, not CPU. Workers waiting on a slow speech-to-text call use almost no CPU, so a CPU-based autoscaler sees idle machines while the queue explodes.
+- **Autoscaling is slow compared to a spike.** New instances take one to several minutes to start, pass health checks and warm up. Diwali traffic can triple in less than that. But Diwali is **predictable**. Use **scheduled scaling** to pre-scale to the expected evening capacity at 5 pm, and let the autoscaler handle the difference.
+
+Some capacity cannot be autoscaled at all, so it is arranged weeks in advance: higher rate limits with both LLM providers and the speech-to-text provider, a bigger database instance, and more WhatsApp throughput if your messaging tier needs it.
+
+Finally, **load test** before the night: replay last year's traffic shape, scaled to this year's shops and then to 1.5 times that, against a production-like environment. The first load test always finds something. Last year's would have found the connection limit.
+
+## Queue-based load levelling
+
+The queue from lesson 7 is your most important Diwali tool. A burst of 1,000 voice notes per second does not have to be processed at 1,000 per second. The queue absorbs the burst, and workers drain it at the rate the downstream providers can handle. This is **queue-based load levelling**.
+
+It trades load for latency. If the queue holds 30,000 jobs and workers drain 1,200 per second, the newest job waits about 25 seconds. So the question for Diwali is not "can we process everything?" but "how long are we willing to let a customer wait, and what do we do when the wait gets longer than that?". DukaanVoice's answer: under 15 seconds is acceptable on Diwali, and beyond that, shed load.
+
+<Diagram
+  fig="18.1"
+  caption="The Diwali architecture. Separate priority queues, workers scaled on queue age, circuit breakers at the gateway, and a load-shedding switch."
+  label="Diwali architecture: WhatsApp and payment webhooks reach autoscaled ingest instances behind rate limiters. Ingest writes to separate queues: a high-priority queue for payments and confirmations, a normal queue for new voice orders, and a low-priority queue for analytics and batch work. Worker pools autoscale on queue age. Workers use PgBouncer in front of Postgres and call providers through the LLM gateway, which has circuit breakers per provider. A load-shedding controller watches queue age and turns off low-priority features in stages."
+  chart={`flowchart TD
+  WA["WhatsApp and payment webhooks"] --> RL["Rate limiters"]
+  RL --> IN["Ingest, autoscaled"]
+  IN --> QH[("High: payments, confirmations")]
+  IN --> QN[("Normal: new voice orders")]
+  IN --> QL[("Low: analytics, batch")]
+  QH --> WH["Workers, scaled on queue age"]
+  QN --> WN["Workers, scaled on queue age"]
+  QL --> WL["Workers, first to pause"]
+  WH --> PB["PgBouncer"]
+  WN --> PB
+  PB --> PG[("Postgres primary")]
+  WN --> GW["LLM gateway with circuit breakers"]
+  GW --> PA["Provider A"]
+  GW --> PBB["Provider B"]
+  LS["Load-shedding controller"] -.->|"watches queue age"| QN
+  LS -.->|"pauses"| WL
+`}
+/>
+
+Notice the separate queues. Payment webhooks and "1" confirmations go to a **high-priority** queue, because a confirmed order waiting on payment is closest to money and to a happy customer. New voice orders are normal priority. Analytics and batch work are low priority and the first to pause. One shared queue would make a payment confirmation wait behind 30,000 new voice notes.
+
+## Backpressure and load shedding
+
+**Backpressure** means a slow component pushing back on the components feeding it, instead of silently accepting more work than it can handle. In practice: bounded queues, concurrency limits (the gateway's per-provider limit from lesson 10), and `429` or `503` responses with `Retry-After` from your own API when it is saturated. Without backpressure, overload turns into timeouts everywhere, retries multiply the load, and the system collapses. With it, the system stays at full speed for the work it accepts.
+
+**Load shedding** is deciding in advance what to stop doing when you cannot do everything. DukaanVoice's Diwali plan is a ladder, triggered automatically by queue age on the normal-priority queue:
+
+| Level | Trigger | What is shed |
+| --- | --- | --- |
+| 1 | Queue age over 8 s | Pause batch jobs and nightly work; analytics answers from precomputed summaries only |
+| 2 | Over 15 s | Turn off voice replies (text only); dashboard refresh interval from 10 s to 60 s |
+| 3 | Over 30 s | Skip reranking and large-model escalation (more clarifying questions instead); shopkeeper analytics paused |
+| 4 | Over 60 s | New voice notes get an immediate "we're very busy, please type your order" reply; text orders still processed |
+
+Each level trades a little quality for capacity, in an order chosen when everyone was calm. The core path (customers ordering, confirming and paying) is the last thing to degrade.
+
+## Rate limiting with a token bucket
+
+Rate limits protect the system from any single source overwhelming it: an abusive number (lesson 16), a buggy shopkeeper app retrying in a loop, a shop running an import. The standard algorithm is the **token bucket**. Each key (a phone number, a shop, an API client) has a bucket that holds up to a fixed number of tokens and refills at a steady rate. Each request takes a token; if the bucket is empty, the request is rejected or delayed. The bucket size allows short bursts; the refill rate sets the sustained limit.
+
+```ts title="shared/token-bucket.ts"
+// One bucket per key. In production this state lives in Redis, updated atomically
+// (a small Lua script), so every instance shares the same buckets.
+type Bucket = { tokens: number; updatedAt: number };
+
+export function take(b: Bucket, now: number, capacity: number, refillPerSec: number): boolean {
+  const elapsed = (now - b.updatedAt) / 1000;
+  b.tokens = Math.min(capacity, b.tokens + elapsed * refillPerSec); // refill since last call
+  b.updatedAt = now;
+  if (b.tokens < 1) return false;                                    // empty: reject with 429 + Retry-After
+  b.tokens -= 1;
+  return true;
+}
+
+// Per customer number: burst of 10 voice notes, then 1 per minute sustained
+// take(bucket, Date.now(), 10, 1 / 60)
+```
+
+The same idea governs outbound calls: the gateway keeps a bucket per provider, sized below the provider's tokens-per-minute limit, so DukaanVoice slows itself down before the provider does it with `429`s.
+
+## Scaling the database
+
+The database is usually the hardest part to scale, so take it in order, cheapest first.
+
+**Connection pooling.** Last year's outage was not CPU or disk; it was connections. Each Postgres connection is a process with real memory cost, and a few hundred is a practical ceiling for many instances. Two hundred workers with a pool of ten each wants 2,000. A **connection pooler** like PgBouncer sits in front of Postgres and multiplexes many client connections onto a small number of database connections. It is the single highest-value fix on this list.
+
+**Vertical scaling and query hygiene.** A bigger instance, the indexes from lesson 4, caching and read replicas from lesson 6, and no long transactions. A well-tuned Postgres primary handles thousands of writes per second. At 2 million orders a day, DukaanVoice averages about 23 order writes per second, and messages, items and status changes multiply that to a few hundred; on Diwali, a few thousand. That is within reach of one primary, with care.
+
+**Partitioning.** Within one database, large tables can be split into **partitions**. DukaanVoice partitions `messages` and `orders` by month. Queries for recent data touch only recent partitions, indexes stay smaller, and enforcing the retention policy from lesson 16 becomes "drop the partition from 13 months ago" instead of a huge `DELETE`.
+
+**Sharding.** When one primary can no longer handle the writes or hold the data, you split data across several independent databases, each holding a subset: **sharding**. Everything hinges on the **shard key**, the value that decides which shard a row lives on. Choose it so that most queries touch exactly one shard.
+
+For DukaanVoice the answer is clear: almost every query is "for this shop". Sharding by `shop_id` keeps each shop's orders, products and customers together, so queries stay on one shard. This is why lesson 4 put `shop_id` on every tenant table and why lesson 5 chose globally unique UUIDv7 keys: both were preparation for this moment, made when they were cheap. Extensions like Citus can shard Postgres by a distribution column; the alternative is application-level routing from a shop-to-shard lookup.
+
+Sharding has real costs: cross-shard queries (platform-wide analytics) move to a separate analytics store, rebalancing is work, and every operation must know its shard. So the honest Diwali plan is: pooling, a bigger primary, partitions and replicas this year; sharding prepared but not switched on until the write load demands it.
+
+<Decision id="shard-key" />
+
+## Multi-region basics
+
+DukaanVoice runs in one cloud region in India. Should it run in two?
+
+There are two separate reasons to go multi-region, and they lead to different designs:
+
+- **Latency for users far away.** All of DukaanVoice's users are in India, close to one region, so this does not apply.
+- **Disaster recovery.** If the whole region has an outage, the business stops. This does apply, at the scale of 50,000 shops.
+
+Two numbers define a disaster recovery design. **RPO** (recovery point objective) is how much recent data you can afford to lose. **RTO** (recovery time objective) is how long you can afford to be down. DukaanVoice's targets are an RPO of under a minute and an RTO of under an hour, which fits an **active-passive** design: a standby database in a second Indian region receiving continuous replication, infrastructure defined as code so it can be brought up quickly, and a practised failover runbook. Running **active-active** (both regions taking writes for the same shops) is far more complex, for reasons the next section explains.
+
+Keeping both regions in India also keeps things simple with regulators: payment data in particular has localisation requirements set by the Reserve Bank of India for payment system providers, and your payment gateway's contract will say what applies to you.
+
+## CAP and consistency, in plain words
+
+Imagine DukaanVoice did run active-active in two regions, and the network link between them failed for five minutes. This is a **network partition**: both sides are running, but they cannot talk to each other.
+
+A customer in Hyderabad orders Ravi's last bag of atta through region 1. A minute later, a customer whose request lands in region 2 orders the same bag. Region 2 cannot ask region 1 what happened. It has two choices:
+
+- **Refuse or delay the order** until it can confirm with region 1. The data stays correct, but the system is unavailable for that operation. This chooses **consistency**.
+- **Accept the order** using its possibly stale view. The system stays available, but two customers now hold one bag, and someone has to reconcile later. This chooses **availability**.
+
+That is the **CAP theorem** in practice: when a partition happens, a distributed system must choose between consistency and availability for each operation. (It is often stated as "pick two of three", which is misleading: partitions are not optional, so the real choice is what to do when one happens.) A related idea, **PACELC**, adds that even when there is no partition, you trade **latency** against consistency, because confirming with another region takes time.
+
+The useful insight is that you do not choose once for the whole system. You choose **per feature**:
+
+- **Stock reservation and payment status:** consistency. All writes for a shop go to that shop's home primary; if it is unreachable, the order waits or the customer is told to try again in a minute.
+- **Message intake:** availability. Always accept and enqueue a customer's message; process it when possible.
+- **Dashboards, search indexes, analytics:** availability with **eventual consistency**: they catch up within seconds and nobody is harmed in between.
+
+<Decision id="consistency-per-feature" />
+
+## Timeouts and circuit breakers
+
+On Diwali night, slow is worse than down. A provider that fails instantly is easy to route around. A provider that takes 30 seconds to fail ties up every worker waiting on it. Two tools prevent that.
+
+**Timeouts everywhere.** Every network call has one, set from the latency budget (lesson 9), and the deadline is passed down so later steps do not start work that cannot finish in time (lesson 10). There is no such thing as a call without a timeout; there is only a call whose timeout is "whenever the operating system gives up".
+
+**Circuit breakers.** A circuit breaker wraps calls to a dependency and tracks failures. After too many failures in a short window, it **opens**: calls fail immediately without even trying, which protects both your workers and the struggling dependency. After a cool-down, it lets a few trial requests through (**half-open**). If they succeed, it **closes** and normal traffic resumes; if not, it opens again.
+
+<Diagram
+  fig="18.2"
+  caption="Circuit breaker states. When open, calls fail fast and the gateway falls back immediately instead of waiting for timeouts."
+  label="Circuit breaker state diagram: closed, where calls pass through and failures are counted; open, entered when the failure rate exceeds a threshold, where calls fail immediately; and half-open, entered after a cool-down, where a few trial calls are allowed. Success in half-open returns to closed; failure returns to open."
+  chart={`stateDiagram-v2
+  [*] --> Closed
+  Closed --> Open: failure rate over 50% in 30 s
+  Open --> HalfOpen: after 20 s cool-down
+  HalfOpen --> Closed: trial calls succeed
+  HalfOpen --> Open: a trial call fails
+`}
+/>
+
+In DukaanVoice, every provider in the gateway has its own breaker (the `breaker.isOpen` check in lesson 10). When speech-to-text provider A's breaker opens, traffic moves to provider B immediately, with no 8-second timeouts first.
+
+## Graceful degradation
+
+**Graceful degradation** means that when part of the system fails, the product gets worse instead of stopping. For each dependency, decide in advance what "worse" looks like:
+
+| If this fails | DukaanVoice does this |
+| --- | --- |
+| Speech-to-text (both providers) | Text-only mode: voice notes get "Sorry, we can't listen to voice notes right now. Please type your order." Text orders work normally. |
+| LLM providers (both) | Orders go to the shopkeeper's app as transcripts with audio links, for manual entry; the customer is told the shop will confirm shortly. |
+| Reranker or vector search | Trigram search only; more clarifying questions. |
+| Payment gateway | Orders are confirmed with cash or UPI on delivery, if the shop allows it. |
+| Analytics replica | Precomputed answers only. |
+| Redis | Rate limits fail open with conservative in-process limits; sessions fall back to the database. |
+
+Each fallback is tested, not just written down. A fallback that has never run is a guess.
+
+## SLOs and error budgets
+
+How do you know whether Diwali went "well"? And how do you decide whether to ship a risky change the week before? With **service level objectives**.
+
+- A **service level indicator** (SLI) is a measurement of user experience: the fraction of voice notes that get a correct summary within 15 seconds; the fraction of payment webhooks processed within 30 seconds.
+- A **service level objective** (SLO) is a target for an SLI over a period: 99.9% of voice notes answered within 15 seconds, measured over 30 days.
+- A **service level agreement** (SLA) is a contractual promise with consequences, usually looser than your internal SLO.
+
+The gap between 100% and the SLO is the **error budget**. At 99.9% over 30 days, that is 0.1% of 43,200 minutes: about **43 minutes** of bad experience per month. The error budget turns arguments into arithmetic. If you have spent most of it this month, you slow down risky releases and invest in reliability. If you have plenty left, you can take more risk. Alerts fire on **burn rate**: how fast you are spending the budget, so a fast burn pages someone immediately and a slow burn opens a ticket.
+
+DukaanVoice's Diwali policy follows from this: a **change freeze** for the week (no prompt, model or schema changes; only urgent fixes), on-call engineers with a written runbook for each degradation level, and a dashboard showing the SLIs, queue ages, breaker states and the current load-shedding level.
+
+## What the architecture looks like now
+
+On Diwali night, DukaanVoice runs pre-scaled ingest and worker pools that autoscale on queue age; separate high, normal and low priority queues; token-bucket rate limits per sender, shop and provider; a load-shedding ladder triggered by queue age; PgBouncer in front of a larger Postgres primary with monthly partitions and read replicas, with sharding by `shop_id` prepared; per-provider circuit breakers in the gateway; tested fallbacks for every dependency; an active-passive disaster recovery region in India; and SLOs with burn-rate alerts. This year, the peak hits 1,040 messages per second at 8:12 pm. The shedding controller reaches level 1 for nine minutes. The p95 reply time is 7.8 seconds.
+
+## Interview angle
+
+<Interview
+  ask="Traffic will spike to 10 times normal on one evening. Walk me through how the system survives."
+  mistake="“Autoscaling handles it.” Autoscaling is slow relative to spikes and does not help dependencies you cannot scale, like a database's connection limit or a provider's rate limit."
+>
+
+- Estimate the peak, then pre-scale for predictable events and autoscale workers on queue age.
+- Queues to level load, with priority separation, and a clear maximum acceptable wait.
+- Backpressure and a load-shedding plan decided in advance, protecting the core path.
+- Database: pooling first, then vertical scaling, replicas, partitioning; sharding by a well-chosen key when writes demand it.
+- Timeouts, circuit breakers and graceful degradation per dependency; consistency chosen per feature; SLOs and error budgets to define success.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Pre-scale for predictable spikes, autoscale workers on queue age, and arrange provider capacity weeks ahead. Load test at 1.5 times the expected peak.
+- Queues trade load for latency. Separate priorities, apply backpressure, and shed low-value work in a planned order.
+- Scale the database cheapest-first: connection pooling, vertical scaling, replicas, partitions, then sharding by a tenant key.
+- Under a partition you choose consistency or availability per feature: strong for stock and payments, eventual for displays.
+- Timeouts, circuit breakers and tested fallbacks turn failures into degradation; SLOs and error budgets turn reliability into arithmetic.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Voice workers spend most of their time waiting on speech-to-text and LLM calls. What should their autoscaler watch?",
+      options: [
+        "CPU utilisation, because it is the standard autoscaling metric",
+        "Queue age or depth, because waiting workers use little CPU while the backlog grows",
+        "Memory usage of each worker",
+        "The number of shops online",
+      ],
+      answer: "B",
+      why: "I/O-bound workers look idle to a CPU-based autoscaler even when the queue is exploding. Queue age measures the user impact directly. Memory and shop counts do not track the backlog.",
+    },
+    {
+      q: "During a network partition between two regions, region 2 receives an order for the last bag of atta, which region 1 may already have sold. Choosing availability means:",
+      options: [
+        "Region 2 refuses the order until it can confirm with region 1",
+        "Both regions stop accepting all traffic until the partition heals",
+        "The partition is prevented by adding a third region",
+        "Region 2 accepts the order using its possibly stale stock, and the conflict is reconciled later",
+      ],
+      answer: "D",
+      why: "Availability means answering with what you have, risking inconsistency, here an oversold bag. Refusing is the consistency choice. Stopping everything is neither. Extra regions do not prevent partitions. That is why DukaanVoice chooses consistency for stock.",
+    },
+    {
+      q: "DukaanVoice's SLO is 99.9% of voice notes answered within 15 seconds over 30 days. Roughly how much error budget is that?",
+      options: [
+        "About 43 minutes of failing experience per 30 days",
+        "About 4 minutes per 30 days",
+        "About 7 hours per 30 days",
+        "About 1.5 minutes per day, which must not be exceeded on any single day",
+      ],
+      answer: "A",
+      why: "0.1% of 30 days × 24 hours × 60 minutes = 43.2 minutes. 4 minutes would be 99.99%, and 7 hours would be about 99%. The budget is measured over the whole window, not per day, which is why burn-rate alerts look at how fast it is being spent.",
+    },
+  ]}
+/>

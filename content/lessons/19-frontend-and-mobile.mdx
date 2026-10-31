@@ -1,3 +1,235 @@
 ## The problem
 
-Coming soon.
+The backend survived Diwali. The shopkeeper app did not have such a good night.
+
+- In Karimnagar, Suresh's shop sits where mobile data drops to one bar every few minutes. He taps "packed" on an order, the spinner turns for 20 seconds, and the tap is lost. He taps again later; now the customer gets two "your order is packed" messages.
+- Two staff phones at a supermarket in Warangal adjust stock while offline. When both reconnect, one adjustment silently overwrites the other, and the stock count is off by 12.
+- Several shopkeepers miss new-order notifications completely. Their phones are budget Android models that aggressively kill background apps to save battery.
+- On the web dashboard, the answer to "what sold most this week?" appears all at once after six seconds of a blank box. Shopkeepers think it is broken and ask again, which doubles the cost.
+- 18% of shopkeepers still run app version 1.x. Some screens crash on the new `out_for_delivery` status, exactly as lesson 5 predicted.
+
+The frontend is where all the backend's careful design either reaches the user or gets lost. This lesson covers the decisions on the device and in the browser that matter as much as anything on the server.
+
+## Offline-first
+
+Most React apps you have built are **online-first**: the UI fetches from the API, shows a spinner while waiting, and shows an error if the network fails. That works on office Wi-Fi. For a shopkeeper in a small town, the network is not reliably there, and a spinner is a broken app.
+
+An **offline-first** app reverses the dependency. The UI reads from and writes to a **local database on the device**, which is always available. A separate **sync engine** moves changes between the device and the server whenever a connection exists. The network becomes a background detail instead of a requirement for every tap.
+
+For React Native, the usual building blocks are an embedded **SQLite** database (several libraries wrap it, some with reactive queries and sync helpers built in) and a small amount of sync code you write yourself or adopt from a sync library. The specific library matters less than the shape:
+
+1. **Reads come from the local database.** The orders list renders instantly from what is on the phone.
+2. **Writes go to the local database and an outbox of operations**, both in one local transaction. The UI updates immediately.
+3. **The sync engine pushes outbox operations** to the server when online, each with an idempotency key, and **pulls changes** made elsewhere since the last sync.
+
+<Diagram
+  fig="19.1"
+  caption="Offline-first sync. The UI only talks to the local database; the sync engine talks to the server when it can."
+  label="Offline sync: the shopkeeper's taps write to the local SQLite database and a local outbox of operations in one transaction, and the UI re-renders from the local database. When the network is available, the sync engine pushes outbox operations to the server API with idempotency keys and receives accepted or rejected results, then pulls changes since its last cursor from the server's change log and applies them locally."
+  chart={`flowchart TD
+  UI["App screens"] -->|"read"| LDB[("Local SQLite")]
+  UI -->|"write"| TX["Local transaction"]
+  TX --> LDB
+  TX --> OB[("Local outbox of operations")]
+  SE["Sync engine"] -->|"push ops with idempotency keys"| API["Server API"]
+  OB --> SE
+  API -->|"accepted or rejected"| SE
+  SE -->|"pull changes since cursor"| API
+  API --> CL[("Server change log")]
+  SE -->|"apply changes"| LDB
+`}
+/>
+
+Here is the heart of it: the local write and the outbox entry happen together, exactly like the server-side outbox from lesson 7:
+
+```ts title="mobile/sync/ops.ts"
+// Every user action becomes an operation with an id generated on the device (UUIDv7, lesson 5).
+export async function markPacked(orderId: string) {
+  await localDb.transaction(async (tx) => {
+    await tx.execute(`UPDATE orders SET status = 'packed', sync_state = 'pending' WHERE id = ?`, [orderId]);
+    await tx.execute(`INSERT INTO outbox (id, type, payload) VALUES (?, 'order.mark_packed', ?)`,
+      [uuidv7(), JSON.stringify({ orderId })]);
+  });
+  syncSoon(); // try now; if offline, the next connection will flush the outbox
+}
+
+async function flushOutbox() {
+  for (const op of await localDb.getAll(`SELECT * FROM outbox ORDER BY id`)) {
+    const res = await api.post(`/v1/ops`, op.payload, { headers: { "Idempotency-Key": op.id } }); // retries are replays
+    if (res.ok || res.status === 409 || res.status === 422) await applyServerResult(op, res);     // done either way
+    else break; // network or 5xx: keep the op, retry later in order
+  }
+}
+```
+
+Suresh's double "packed" message cannot happen any more: his second tap is a no-op locally, and even if an operation is sent twice, the idempotency key from lesson 5 turns the second send into a replay.
+
+Do not rely on the device's "am I online?" signal to decide whether to try. Connectivity APIs report whether there is a network interface, not whether your API is reachable. Try, with a short timeout, and let failures keep the operation in the outbox.
+
+## Sync and conflicts
+
+Pulling changes needs a reliable notion of "what changed since I last synced". Use a **server-assigned cursor**: a change log or a monotonically increasing sequence number on rows, assigned by the database. Never use device clocks for this. Phone clocks are often wrong by minutes, sometimes by days.
+
+**Conflicts** happen when the same data changes in two places before they sync, like the two stock adjustments in Warangal. There are a few standard strategies:
+
+- **Last-write-wins (LWW).** The most recent write (by server receive time) replaces the other. Trivial, and it silently throws away a change. Fine for a field one person owns, like the shop's opening hours.
+- **Operations instead of values.** Send **intent** ("decrease stock of atta by 2", "add 5 received from distributor") rather than the resulting value ("stock is now 8"). The server applies operations in order to the current value, so two offline adjustments of −2 and −10 both apply, and the count ends up right. This is how DukaanVoice syncs stock.
+- **Server-authoritative validation.** Some operations can be rejected: you cannot mark a cancelled order as packed. The server returns `409`, and the app shows the shopkeeper what happened instead of failing silently.
+- **CRDTs** (conflict-free replicated data types) are data structures designed to merge concurrent edits automatically and correctly. They power collaborative editors and are worth knowing about; for DukaanVoice's simple, well-owned data, operations plus server validation are enough.
+
+<Decision id="conflict-strategy" />
+
+## Optimistic UI, carefully
+
+**Optimistic UI** means updating the screen immediately as if the action succeeded, and correcting it if the server later disagrees. Offline-first apps are optimistic by nature, and it makes the app feel instant.
+
+But be deliberate about what you show as done:
+
+- **Optimistic is right** for actions the user owns and that rarely fail: marking packed, editing a product name, adjusting stock.
+- **Show a pending state** for anything that depends on someone else or on money: payment status, a refund, a stock reservation for a customer. A small "syncing" mark or a "waiting for payment" label is honest. Showing "paid" before the payment webhook has been verified is not.
+- **Make rollbacks visible.** If the server rejects an operation, tell the user what changed and why ("Order 0193 was cancelled by the customer before you packed it"). Silent rollbacks look like data loss.
+
+## Push notifications
+
+New orders reach the shopkeeper's phone through **push notifications**, delivered by Firebase Cloud Messaging (FCM) on Android and the Apple Push Notification service (APNs) on iOS, either directly or through a service that wraps both. Push is excellent for waking up a user and unreliable as a data channel:
+
+- Delivery is best effort and can be delayed or dropped, especially when a phone is in a battery-saving mode. Many budget Android phones apply aggressive manufacturer-specific restrictions on background apps.
+- **Never use a push notification as the source of truth.** It is a hint: "something changed, go sync". When the app opens, it syncs and shows the real state.
+- Guide shopkeepers through exempting the app from battery optimisation during onboarding, with screenshots for the common phone brands. This single step fixed most of the missed notifications.
+- For new orders specifically, add an **escalation**: if an order is not acknowledged in the app within five minutes, DukaanVoice sends the shopkeeper a WhatsApp message, the one app that is never killed on these phones.
+- Keep device tokens fresh: re-register on every app start, and remove tokens that the push service reports as invalid.
+
+## Streaming AI responses into the UI
+
+The six-second blank box is a perception problem. The analytics answer takes as long as it takes, but the shopkeeper sees nothing until the end. Streaming the answer token by token (lesson 8's time to first token, made visible) means text starts appearing in under a second.
+
+There are two common ways to push data from server to browser continuously:
+
+- **Server-Sent Events** (SSE): the server keeps an HTTP response open and writes events to it as they happen. One direction only, server to client. It is plain HTTP, works through most proxies and load balancers, and the browser's `EventSource` reconnects automatically.
+- **WebSockets**: a persistent, two-way connection. Both sides can send at any time. More capable, and more work: connection state on the server, sticky routing or a pub/sub layer behind it, and custom reconnection.
+
+For streaming a model's answer, data flows one way, so SSE (or simply a streamed HTTP response) is the natural fit. The question goes up as a normal `POST`; the answer streams back.
+
+```ts title="app/api/ask/route.ts (Next.js route handler)"
+export async function POST(req: Request) {
+  const { question } = await req.json();
+  const shopId = await requireShop(req);                       // auth, as always
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      for await (const chunk of analyticsAgent.stream(shopId, question, { signal: req.signal })) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)); // one SSE event per chunk
+      }
+      controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform" },
+  });
+}
+```
+
+On the client, the browser's built-in `EventSource` only supports `GET` requests without a body, so for a `POST` you read the response body as a stream with `fetch` and parse the events yourself, or use a small library that does. A few practical details:
+
+- **Cancel on navigation.** Abort the request when the user leaves the page; `req.signal` above lets the server stop the agent and stop paying for tokens nobody will read.
+- **Watch for buffering.** Some proxies and compression layers buffer responses, which turns a stream back into a six-second wait. Test the real deployment path, not just localhost.
+- **Render incrementally but safely.** Append text as it arrives; if you render markdown, do it in a way that tolerates incomplete syntax mid-stream.
+- **Mobile is different.** React Native's networking has historically had limited support for streaming response bodies, depending on version and platform. Check what your version supports, or use a library built for SSE in React Native.
+
+<Decision id="sse-vs-websockets" />
+
+## Rendering: static, server or client
+
+DukaanVoice's web surfaces have different audiences, and Next.js lets you choose how each route renders:
+
+- **Static generation** builds HTML at deploy time. The marketing site and help articles: fast everywhere, cheap to serve from a CDN, no server work per request.
+- **Server rendering**, with React Server Components in the App Router, generates HTML on the server per request or per revalidation period. DukaanVoice's public **shop pages** (a link a customer can open from WhatsApp to browse a shop's catalog) are rendered on the server and revalidated every few minutes, so they load fast on a cheap phone on a slow network and need very little JavaScript.
+- **Client rendering** runs in the browser after JavaScript loads. The live order dashboard is behind a login, highly interactive and personalised, so client components with streaming updates fit it best.
+
+The deeper principle for India's device landscape: on a budget Android phone, **JavaScript is the expensive resource**. Downloading, parsing and executing a large bundle can take seconds even after the network has delivered it. Server components that send HTML instead of code, and keeping client components small and leaf-level, matter more here than almost any backend optimisation.
+
+<Decision id="render-mode" />
+
+## Forced updates and old app versions
+
+Back to the 18% on version 1.x. Lesson 5 set up the essentials: `/v1` in every path, additive-only changes, an `X-App-Version` header on every request, and a minimum-supported-version check from the very first release. Here is how DukaanVoice uses them:
+
+- **A version policy endpoint**, called at app start, returns a minimum version and a recommended version per platform. Below recommended, the app shows a dismissible "update available" banner. Below minimum, it shows a blocking screen with a button to the store.
+- **Hard blocks are rare and planned.** They are used for security fixes or when an old version would corrupt data. Before raising the minimum, the team checks the version telemetry from the `X-App-Version` header: blocking 18% of shopkeepers on a Monday morning would be worse than the bug.
+- **In-app update flows.** Android's Play Store offers an in-app update API that can download and install an update from inside the app, which helps a lot with users who never open the store.
+- **Over-the-air JavaScript updates.** React Native apps can, with the right tooling, download new JavaScript bundles without a store release, which fixes most bugs within hours. Store policies limit what you can change this way (no new native code, no changing the app's purpose), so it complements store releases rather than replacing them.
+- **Server-side kill switches.** Features can be turned off for specific app versions from the server (lesson 20 covers feature flags), which is how the `out_for_delivery` crash was stopped within minutes: that status is now mapped to `packed` in responses to app versions below 1.6, until those users update.
+
+## What the architecture looks like now
+
+The shopkeeper app is offline-first: screens read from local SQLite, every action is a local transaction plus an outbox operation with a device-generated UUIDv7, and a sync engine pushes operations with idempotency keys and pulls changes by a server-assigned cursor. Stock syncs as operations, settings as last-write-wins, and the server rejects invalid transitions visibly. Push notifications are hints followed by a sync, with WhatsApp escalation for unacknowledged orders. The web dashboard streams analytics answers over SSE with cancellation, while marketing pages are static and public shop pages are server-rendered. Old app versions get banners, planned minimum versions, in-app updates and version-aware responses.
+
+## Interview angle
+
+<Interview
+  ask="Your users are on unreliable mobile networks. How do you design the app?"
+  mistake="Designing around retries and spinners. Interviewers want a local source of truth, an operation queue with idempotency, a sync protocol and an explicit conflict strategy."
+>
+
+- Offline-first: local database as the UI's source, writes as local transaction plus outbox, background sync.
+- Idempotent operations with device-generated IDs; server-assigned cursors, never device clocks.
+- A conflict strategy per data type: operations for counters, last-write-wins for owned fields, server validation for state machines.
+- Optimistic UI for user-owned actions, explicit pending states for money.
+- Push as a hint, not data; streaming responses with SSE; rendering choices driven by device constraints; a version policy for apps that never update.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- On unreliable networks, make the device's local database the UI's source of truth and sync in the background through an outbox of idempotent operations.
+- Sync with server-assigned cursors; resolve conflicts per data type: operations for counts, last-write-wins for single-owner fields, server validation for state.
+- Be optimistic for user-owned actions and honest (pending) for anything involving money or other people.
+- Push notifications wake the app; they are not data. Stream AI answers with SSE and cancel on navigation.
+- Choose static, server or client rendering per route, minimise JavaScript for budget phones, and manage old app versions with telemetry, soft and hard minimums, and server-side switches.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Two offline phones adjust the same product's stock: one sells 2, the other records 10 damaged. How should DukaanVoice sync these?",
+      options: [
+        "Send each change as an operation (−2 and −10) for the server to apply to the current value",
+        "Last-write-wins on the stock value, using each phone's clock to decide which is newer",
+        "Reject whichever change arrives second and ask the shopkeeper to redo it",
+        "Average the two resulting stock values",
+      ],
+      answer: "A",
+      why: "Operations preserve intent, so both adjustments apply and the count is right. Last-write-wins discards one change, and phone clocks are unreliable anyway. Rejecting valid work frustrates users, and averaging is simply wrong.",
+    },
+    {
+      q: "Why should a new-order push notification not be treated as the source of truth in the app?",
+      options: [
+        "Push payloads cannot contain order IDs",
+        "Push notifications are encrypted, so the app cannot read them",
+        "Push delivery is best effort and can be delayed or dropped, so the app must sync to learn the real state",
+        "Push notifications always arrive before the order is saved",
+      ],
+      answer: "C",
+      why: "Push services do not guarantee delivery, especially on phones with aggressive battery savers. The notification is a hint to sync. Payloads can carry IDs and apps can read them, and a notification sent from the outbox is sent after the order is saved.",
+    },
+    {
+      q: "The dashboard streams analytics answers token by token. Which transport fits best?",
+      options: [
+        "WebSockets, because streaming always needs a two-way connection",
+        "Server-Sent Events over HTTP, because data flows one way from server to browser",
+        "Polling the API every 200 milliseconds for new tokens",
+        "Push notifications, one per token",
+      ],
+      answer: "B",
+      why: "The answer flows only from server to browser; the question is a normal POST. SSE is simple HTTP, works through most proxies and handles reconnection. WebSockets add complexity without need, polling wastes requests, and push notifications are not a streaming channel.",
+    },
+  ]}
+/>

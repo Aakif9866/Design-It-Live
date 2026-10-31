@@ -27,10 +27,26 @@ function clock(min: number) {
   return `${((h + 11) % 12) + 1}:${m} ${h >= 12 ? "pm" : "am"}`;
 }
 
-function DayLedger({ day, carried }: { day: Day; carried: number }) {
+type Row = { lesson: (typeof LESSONS)[number]; start: number; running: number; br?: { start: number; minutes: number; label: string } };
+
+// Pure schedule calculation: start times, breaks and a running reading total.
+function schedule(day: Day, carried: number) {
   let t = START[day];
   let running = carried;
-  const lessons = LESSONS.filter((l) => l.day === day);
+  const rows: Row[] = [];
+  for (const lesson of LESSONS.filter((l) => l.day === day)) {
+    const start = t;
+    t += lesson.minutes;
+    running += lesson.minutes;
+    const br = BREAKS[lesson.order];
+    rows.push({ lesson, start, running, br: br && { start: t, ...br } });
+    if (br) t += br.minutes;
+  }
+  return { rows, end: t, running };
+}
+
+function DayLedger({ day, carried }: { day: Day; carried: number }) {
+  const { rows, end, running } = schedule(day, carried);
   return (
     <div className="ledger-wrap">
       <table className="ledger">
@@ -47,40 +63,32 @@ function DayLedger({ day, carried }: { day: Day; carried: number }) {
           </tr>
         </thead>
         <tbody>
-          {lessons.map((l) => {
-            const start = t;
-            t += l.minutes;
-            running += l.minutes;
-            const br = BREAKS[l.order];
-            const breakStart = t;
-            if (br) t += br.minutes;
-            return (
-              <Fragment key={l.slug}>
-                <tr>
-                  <td className="time">{clock(start)}</td>
-                  <td>
-                    <Link href={`/lessons/${l.slug}`}>
-                      {l.order}. {l.title}
-                    </Link>
+          {rows.map(({ lesson: l, start, running: total, br }) => (
+            <Fragment key={l.slug}>
+              <tr>
+                <td className="time">{clock(start)}</td>
+                <td>
+                  <Link href={`/lessons/${l.slug}`}>
+                    {l.order}. {l.title}
+                  </Link>
+                </td>
+                <td className="num">{l.minutes}</td>
+                <td className="num">{formatMinutes(total)}</td>
+              </tr>
+              {br && (
+                <tr className="break">
+                  <td className="time">{clock(br.start)}</td>
+                  <td colSpan={3}>
+                    {br.label} {br.minutes} minutes.
                   </td>
-                  <td className="num">{l.minutes}</td>
-                  <td className="num">{formatMinutes(running)}</td>
                 </tr>
-                {br && (
-                  <tr className="break">
-                    <td className="time">{clock(breakStart)}</td>
-                    <td colSpan={3}>
-                      {br.label} {br.minutes} minutes.
-                    </td>
-                  </tr>
-                )}
-              </Fragment>
-            );
-          })}
+              )}
+            </Fragment>
+          ))}
           <tr className="total">
-            <td className="time">{clock(t)}</td>
+            <td className="time">{clock(end)}</td>
             <td>{day} reading</td>
-            <td className="num">{lessons.reduce((s, l) => s + l.minutes, 0)}</td>
+            <td className="num">{running - carried}</td>
             <td className="num">{formatMinutes(running)}</td>
           </tr>
         </tbody>

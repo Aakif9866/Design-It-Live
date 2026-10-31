@@ -541,13 +541,12 @@ figure[data-rehype-pretty-code-figure] figcaption,
   overflow-x: auto;
 }
 .diagram-canvas {
-  display: flex;
-  justify-content: center;
   min-height: 6rem;
 }
 .diagram-canvas svg {
+  display: block;
+  margin: 0 auto;
   height: auto;
-  max-width: 100%;
 }
 .diagram-loading {
   color: var(--muted);
@@ -565,6 +564,9 @@ figure[data-rehype-pretty-code-figure] figcaption,
   font-size: 1rem;
   color: var(--muted);
   line-height: 1.4;
+}
+.diagram-hint {
+  font-style: italic;
 }
 .diagram-fig {
   color: var(--royal);

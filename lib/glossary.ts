@@ -1,5 +1,225 @@
 export type Term = { term: string; def: string; lesson: string };
 
+// Each term links to the lesson that explains it properly.
 export const GLOSSARY: Term[] = [
+  // Lesson 1
   { term: "Multi-tenancy", def: "Serving many customers (tenants) from one shared system while keeping their data separate.", lesson: "welcome" },
+  { term: "UPI", def: "Unified Payments Interface: India's real-time bank-to-bank payment system, used for DukaanVoice's payment links.", lesson: "welcome" },
+  { term: "DPDP Act", def: "India's Digital Personal Data Protection Act, 2023, which governs how personal data is collected, used and erased.", lesson: "safety-and-privacy" },
+  { term: "LLM", def: "Large language model: a model trained on large amounts of text that generates text, JSON or tool calls from a prompt.", lesson: "llms-as-components" },
+
+  // Lesson 2
+  { term: "Functional requirement", def: "What a system does: the features a user can point at.", lesson: "thinking-like-a-designer" },
+  { term: "Non-functional requirement", def: "How well a system does it: latency, availability, correctness, cost, privacy and similar qualities.", lesson: "thinking-like-a-designer" },
+  { term: "p95", def: "The 95th percentile: the value that 95% of measurements are below, used for latency targets.", lesson: "thinking-like-a-designer" },
+  { term: "Back-of-envelope estimation", def: "Fast, rounded arithmetic to find which parts of a design matter: users to requests per second to storage.", lesson: "thinking-like-a-designer" },
+  { term: "Peak factor", def: "How much busier the busiest period is than the average, such as 3x in the evening or 10x on Diwali.", lesson: "thinking-like-a-designer" },
+  { term: "QPS", def: "Queries (or requests) per second, the basic unit of load.", lesson: "thinking-like-a-designer" },
+  { term: "Little's law", def: "Average items in flight equals arrival rate times average time each one takes.", lesson: "thinking-like-a-designer" },
+  { term: "Token math", def: "Units per month times tokens per unit times price per token: the AI version of capacity planning.", lesson: "thinking-like-a-designer" },
+  { term: "TPM and RPM", def: "Tokens per minute and requests per minute: the usual rate limits set by model providers.", lesson: "thinking-like-a-designer" },
+
+  // Lesson 3
+  { term: "Monolith", def: "A single deployable application containing all features.", lesson: "the-boring-v1" },
+  { term: "Modular monolith", def: "A monolith split into domain modules with explicit interfaces that do not reach into each other's data.", lesson: "the-boring-v1" },
+  { term: "Microservices", def: "An architecture of separately deployed services that communicate over the network.", lesson: "the-boring-v1" },
+  { term: "Innovation tokens", def: "The limited amount of unfamiliar technology a team can absorb; spend them on the product.", lesson: "the-boring-v1" },
+  { term: "Webhook", def: "An HTTP request another system makes to your endpoint when something happens.", lesson: "the-boring-v1" },
+  { term: "REST", def: "An API style built on resources (nouns) in URLs, HTTP methods as verbs, and standard status codes.", lesson: "the-boring-v1" },
+  { term: "API versioning", def: "Marking an API contract with a version (such as /v1) so clients that never update keep working.", lesson: "the-boring-v1" },
+  { term: "24-hour customer service window", def: "WhatsApp's rule allowing free-form business replies only within 24 hours of the customer's last message.", lesson: "the-boring-v1" },
+
+  // Lesson 4
+  { term: "JSONB", def: "Postgres's binary JSON column type, which can be indexed and queried.", lesson: "data-modeling" },
+  { term: "B-tree index", def: "A balanced, sorted tree that finds rows by equality, range or order in a few page reads.", lesson: "data-modeling" },
+  { term: "Composite index", def: "An index on several columns in a fixed order, such as (shop_id, created_at).", lesson: "data-modeling" },
+  { term: "Leftmost prefix rule", def: "A composite index only helps queries that filter on its leading columns.", lesson: "data-modeling" },
+  { term: "Partial index", def: "An index covering only rows that match a condition, such as status = 'confirmed'.", lesson: "data-modeling" },
+  { term: "ACID", def: "Atomicity, consistency, isolation and durability: the guarantees of a database transaction.", lesson: "data-modeling" },
+  { term: "Race condition", def: "A bug where the outcome depends on the timing of concurrent operations.", lesson: "data-modeling" },
+  { term: "Lost update", def: "A race where two transactions read the same value and one overwrites the other's change.", lesson: "data-modeling" },
+  { term: "SELECT FOR UPDATE", def: "A query that reads rows and locks them until the transaction ends.", lesson: "data-modeling" },
+  { term: "Deadlock", def: "Two transactions each waiting for a lock the other holds; avoided by locking in a consistent order.", lesson: "data-modeling" },
+  { term: "Optimistic concurrency", def: "Detecting conflicting writes with a version check at write time instead of locking.", lesson: "data-modeling" },
+  { term: "Row-level security", def: "A Postgres feature that filters rows per connection setting, used as a tenant-isolation backstop.", lesson: "data-modeling" },
+
+  // Lesson 5
+  { term: "One-way door", def: "A decision that is hard or impossible to reverse once data or clients depend on it.", lesson: "one-way-doors" },
+  { term: "UUIDv7", def: "A 128-bit unique ID that starts with a timestamp, so new IDs sort roughly by creation time.", lesson: "one-way-doors" },
+  { term: "ULID", def: "A time-ordered, lexicographically sortable unique identifier, similar in purpose to UUIDv7.", lesson: "one-way-doors" },
+  { term: "IDOR", def: "Insecure direct object reference: accessing another user's record by guessing or changing its ID.", lesson: "one-way-doors" },
+  { term: "Paise", def: "One hundredth of a rupee; DukaanVoice stores all money as integer paise.", lesson: "one-way-doors" },
+  { term: "timestamptz", def: "Postgres's timestamp with time zone type, which stores an absolute instant in UTC.", lesson: "one-way-doors" },
+  { term: "Soft delete", def: "Marking a row as deleted (for example with deleted_at) instead of removing it.", lesson: "one-way-doors" },
+  { term: "Idempotency", def: "The property that doing an operation twice has the same effect as doing it once.", lesson: "one-way-doors" },
+  { term: "Idempotency key", def: "A client-generated ID sent with a request so the server can recognise and replay retries.", lesson: "one-way-doors" },
+  { term: "Cursor pagination", def: "Paging by “rows after this one” using an indexed key, instead of skipping N rows.", lesson: "one-way-doors" },
+  { term: "JWT", def: "JSON Web Token: a signed token that can be verified without a database lookup but is hard to revoke early.", lesson: "one-way-doors" },
+  { term: "Signed URL", def: "A time-limited URL granting access to one private object in storage.", lesson: "one-way-doors" },
+  { term: "Tolerant reader", def: "A client that ignores unknown fields and values instead of crashing on them.", lesson: "one-way-doors" },
+
+  // Lesson 6
+  { term: "Cache", def: "A fast store holding copies of expensive data, trading freshness for speed.", lesson: "caching" },
+  { term: "Cache-aside", def: "The app reads the cache first, and on a miss reads the database and fills the cache.", lesson: "caching" },
+  { term: "Write-through cache", def: "A cache updated on every write, so reads after writes are fresh.", lesson: "caching" },
+  { term: "TTL", def: "Time to live: how long a cached entry is kept before it expires.", lesson: "caching" },
+  { term: "Cache invalidation", def: "Removing or updating cached data when the source of truth changes.", lesson: "caching" },
+  { term: "Cache stampede", def: "Many requests missing the same expired key at once and all hitting the database.", lesson: "caching" },
+  { term: "CDN", def: "Content delivery network: edge servers near users that cache static files and images.", lesson: "caching" },
+  { term: "Redis", def: "An in-memory key-value store used for caching, sessions, queues and rate limits.", lesson: "caching" },
+  { term: "Read replica", def: "A copy of the database that receives changes from the primary and serves read-only queries.", lesson: "caching" },
+  { term: "Replication lag", def: "The delay before a write on the primary appears on a replica.", lesson: "caching" },
+  { term: "Read-your-writes", def: "A guarantee that users always see their own recent changes.", lesson: "caching" },
+
+  // Lesson 7
+  { term: "Message queue", def: "A durable buffer between producers that create work and workers that process it.", lesson: "async-systems" },
+  { term: "BullMQ", def: "A Node.js job queue library built on Redis, with retries, delays and priorities.", lesson: "async-systems" },
+  { term: "SQS", def: "Amazon Simple Queue Service, a managed message queue.", lesson: "async-systems" },
+  { term: "Exponential backoff", def: "Waiting longer after each failed retry, typically doubling the delay.", lesson: "async-systems" },
+  { term: "Jitter", def: "Randomness added to retry delays so many clients do not retry in synchronised waves.", lesson: "async-systems" },
+  { term: "Dead-letter queue", def: "A holding queue for jobs that failed repeatedly, kept for inspection and replay.", lesson: "async-systems" },
+  { term: "At-least-once delivery", def: "Every message is delivered one or more times; duplicates are possible, losses are not.", lesson: "async-systems" },
+  { term: "Exactly-once processing", def: "The effect of processing each message once, achieved in practice with at-least-once delivery plus idempotent consumers.", lesson: "async-systems" },
+  { term: "Idempotent consumer", def: "A worker that is safe to run twice on the same message, usually by recording processed IDs.", lesson: "async-systems" },
+  { term: "Dual-write problem", def: "The impossibility of committing to a database and publishing to a queue atomically.", lesson: "async-systems" },
+  { term: "Transactional outbox", def: "Writing events to an outbox table in the same transaction as the data, then publishing them with a relay.", lesson: "async-systems" },
+  { term: "HMAC signature", def: "A hash of a request body with a shared secret, proving the sender holds the secret.", lesson: "async-systems" },
+
+  // Lesson 8
+  { term: "Token", def: "The unit of text a model reads and writes; roughly three-quarters of an English word on average.", lesson: "llms-as-components" },
+  { term: "Tokenizer", def: "The component that splits text into tokens; different scripts and languages produce different counts.", lesson: "llms-as-components" },
+  { term: "TTFT", def: "Time to first token: how long until a model starts producing output.", lesson: "llms-as-components" },
+  { term: "Prefill and decode", def: "The two phases of generation: processing the input in parallel, then producing output tokens one at a time.", lesson: "llms-as-components" },
+  { term: "Context window", def: "The maximum number of tokens, input plus output, a model can handle in one call.", lesson: "llms-as-components" },
+  { term: "Temperature", def: "A setting that controls how random a model's sampling is.", lesson: "llms-as-components" },
+  { term: "Reasoning tokens", def: "Internal “thinking” tokens some models generate before answering; usually billed as output.", lesson: "llms-as-components" },
+  { term: "Model pinning", def: "Using a specific dated model version so behaviour does not change without your knowledge.", lesson: "llms-as-components" },
+
+  // Lesson 9
+  { term: "STT", def: "Speech-to-text: converting audio to a transcript.", lesson: "voice-pipeline" },
+  { term: "TTS", def: "Text-to-speech: generating spoken audio from text.", lesson: "voice-pipeline" },
+  { term: "Cascaded pipeline", def: "A voice system built from separate speech-to-text, understanding and response stages.", lesson: "voice-pipeline" },
+  { term: "Speech-to-speech model", def: "A model that takes audio in and produces audio out without an explicit text stage.", lesson: "voice-pipeline" },
+  { term: "Latency budget", def: "An end-to-end latency target split into per-stage targets with owners.", lesson: "voice-pipeline" },
+  { term: "Code-mixing", def: "Switching between languages within a sentence, such as Telugu and English.", lesson: "voice-pipeline" },
+  { term: "WER", def: "Word error rate: the standard accuracy metric for speech recognition.", lesson: "voice-pipeline" },
+
+  // Lesson 10
+  { term: "LLM gateway", def: "One internal service between the app and all model providers, handling routing, limits, caching and logging.", lesson: "llm-gateway" },
+  { term: "Fallback", def: "Switching to another provider or model when the first fails.", lesson: "llm-gateway" },
+  { term: "Model cascade", def: "Trying a cheap model first and escalating to an expensive one only when checks fail.", lesson: "llm-gateway" },
+  { term: "Deadline propagation", def: "Passing the remaining time budget down a call chain so steps do not start work that cannot finish.", lesson: "llm-gateway" },
+  { term: "Hedged request", def: "Sending a duplicate request after a delay and using whichever answer arrives first.", lesson: "llm-gateway" },
+  { term: "Noisy neighbour", def: "One tenant consuming shared capacity and degrading service for others.", lesson: "llm-gateway" },
+  { term: "Semantic cache", def: "A cache that returns stored answers for inputs that are similar in meaning, found by embedding similarity.", lesson: "llm-gateway" },
+  { term: "Prompt caching", def: "A provider feature that reuses work for identical prompt prefixes, usually at a lower price.", lesson: "llm-gateway" },
+
+  // Lesson 11
+  { term: "Zod", def: "A TypeScript schema library that validates data at runtime and infers static types.", lesson: "structured-outputs" },
+  { term: "Structured outputs", def: "A provider mode that constrains generation to match a JSON Schema.", lesson: "structured-outputs" },
+  { term: "JSON mode", def: "A provider mode that guarantees valid JSON but not a particular schema.", lesson: "structured-outputs" },
+  { term: "Tool calling", def: "Letting a model request that your code run a named function with arguments, and continue with the result.", lesson: "structured-outputs" },
+  { term: "Repair loop", def: "Sending validation errors back to the model for a bounded number of correction attempts.", lesson: "structured-outputs" },
+  { term: "Grounding", def: "Checking model output against real data, such as confirming a product exists in this shop.", lesson: "structured-outputs" },
+  { term: "Human in the loop", def: "Requiring a person to confirm before a consequential action, such as payment.", lesson: "structured-outputs" },
+
+  // Lesson 12
+  { term: "RAG", def: "Retrieval-augmented generation: retrieving relevant data and placing it in the model's context.", lesson: "rag" },
+  { term: "Embedding", def: "A vector of numbers representing text so that similar meanings are close together.", lesson: "rag" },
+  { term: "Cosine similarity", def: "A measure of how closely two vectors point in the same direction.", lesson: "rag" },
+  { term: "ANN search", def: "Approximate nearest neighbour search: finding close vectors quickly by accepting occasional misses.", lesson: "rag" },
+  { term: "HNSW", def: "Hierarchical Navigable Small World: a layered graph index for fast approximate vector search.", lesson: "rag" },
+  { term: "pgvector", def: "A Postgres extension for storing vectors and searching them by distance.", lesson: "rag" },
+  { term: "Chunking", def: "Splitting documents into retrievable pieces that make sense on their own.", lesson: "rag" },
+  { term: "Hybrid search", def: "Combining keyword or fuzzy text search with vector search.", lesson: "rag" },
+  { term: "Trigram matching", def: "Comparing strings by their three-character pieces; robust to misspellings (pg_trgm).", lesson: "rag" },
+  { term: "Reciprocal rank fusion", def: "Merging ranked lists by summing 1 / (k + rank) for each item.", lesson: "rag" },
+  { term: "Reranker", def: "A model that scores query and candidate pairs together to reorder a short list.", lesson: "rag" },
+  { term: "Recall@k", def: "The fraction of queries whose correct answer appears in the top k results.", lesson: "rag" },
+
+  // Lesson 13
+  { term: "Workflow", def: "A process whose steps are defined in code, possibly with model calls inside steps.", lesson: "agents-vs-workflows" },
+  { term: "Agent", def: "A loop in which the model chooses the next action and tool until it decides it is done.", lesson: "agents-vs-workflows" },
+  { term: "State machine", def: "A fixed set of states and allowed transitions, such as an order's lifecycle.", lesson: "agents-vs-workflows" },
+  { term: "Text-to-SQL", def: "Having a model write database queries from natural language.", lesson: "agents-vs-workflows" },
+  { term: "Durable execution", def: "Running long workflows so each step's result is persisted and execution resumes after crashes.", lesson: "agents-vs-workflows" },
+  { term: "MCP", def: "Model Context Protocol: an open standard for exposing tools, resources and prompts to AI applications.", lesson: "agents-vs-workflows" },
+  { term: "Multi-agent system", def: "Several agents with separate roles or contexts that hand work to each other.", lesson: "agents-vs-workflows" },
+
+  // Lesson 14
+  { term: "Context engineering", def: "Deciding what goes into a model's context, how much, and in what order, on every call.", lesson: "context-and-memory" },
+  { term: "Rolling summary", def: "A periodically regenerated summary of older conversation turns.", lesson: "context-and-memory" },
+  { term: "Prompt versioning", def: "Treating prompts like code, with version numbers logged on every call.", lesson: "context-and-memory" },
+  { term: "Long-term memory", def: "Facts saved across conversations for future context, often written by the model.", lesson: "context-and-memory" },
+
+  // Lesson 15
+  { term: "Eval", def: "A repeatable measurement of an AI component's quality on a fixed dataset.", lesson: "evals-and-observability" },
+  { term: "Golden dataset", def: "A labelled set of real inputs with correct outputs, used for evals.", lesson: "evals-and-observability" },
+  { term: "Slice", def: "A subset of evaluation data sharing a property, such as language or region.", lesson: "evals-and-observability" },
+  { term: "LLM-as-judge", def: "Using a model to score outputs against a rubric; useful for free text, prone to biases.", lesson: "evals-and-observability" },
+  { term: "Correction rate", def: "How often customers or shopkeepers change an order the system produced.", lesson: "evals-and-observability" },
+  { term: "Trace and span", def: "A trace follows one request through the system; spans are its timed steps.", lesson: "evals-and-observability" },
+  { term: "OpenTelemetry", def: "An open standard and toolkit for producing traces, metrics and logs.", lesson: "evals-and-observability" },
+  { term: "Drift", def: "Quality changing over time because inputs, models or data change.", lesson: "evals-and-observability" },
+
+  // Lesson 16
+  { term: "Prompt injection", def: "Text in a model's input that overrides or subverts its instructions.", lesson: "safety-and-privacy" },
+  { term: "Indirect prompt injection", def: "Injection hidden in content the model retrieves or reads, rather than typed by the user.", lesson: "safety-and-privacy" },
+  { term: "Least privilege", def: "Giving a component only the permissions it needs, so being fooled cannot do much harm.", lesson: "safety-and-privacy" },
+  { term: "Output guard", def: "A final check on outgoing messages for links, payment details, abuse and length.", lesson: "safety-and-privacy" },
+  { term: "PII", def: "Personally identifiable information, such as phone numbers, addresses and voice.", lesson: "safety-and-privacy" },
+  { term: "Redaction", def: "Replacing personal data with placeholders before it reaches models or logs.", lesson: "safety-and-privacy" },
+  { term: "Data minimisation", def: "Collecting and passing on only the personal data a purpose needs.", lesson: "safety-and-privacy" },
+  { term: "Data Fiduciary", def: "Under the DPDP Act, the party that decides why and how personal data is processed.", lesson: "safety-and-privacy" },
+  { term: "Data Principal", def: "Under the DPDP Act, the person the personal data is about.", lesson: "safety-and-privacy" },
+  { term: "Data map", def: "An inventory of every place personal data lives, with retention and deletion methods.", lesson: "safety-and-privacy" },
+
+  // Lesson 17
+  { term: "Unit economics", def: "Revenue and cost per unit of what you sell, such as per order.", lesson: "ai-cost" },
+  { term: "Batch API", def: "A provider option that processes many requests within hours, usually at a discount.", lesson: "ai-cost" },
+  { term: "VAD", def: "Voice activity detection: finding where speech is in audio, used to trim silence.", lesson: "ai-cost" },
+  { term: "Fine-tuning", def: "Further training a model on your labelled examples so it does one task well.", lesson: "ai-cost" },
+  { term: "Break-even volume", def: "Fixed costs divided by saving per unit: the volume above which self-hosting is cheaper.", lesson: "ai-cost" },
+
+  // Lesson 18
+  { term: "Horizontal scaling", def: "Adding more machines rather than bigger ones.", lesson: "diwali-scale" },
+  { term: "Autoscaling", def: "Automatically adding or removing instances based on a metric.", lesson: "diwali-scale" },
+  { term: "Backpressure", def: "A slow component pushing back on its callers instead of accepting unlimited work.", lesson: "diwali-scale" },
+  { term: "Load shedding", def: "Deliberately dropping or degrading low-priority work under overload.", lesson: "diwali-scale" },
+  { term: "Queue-based load levelling", def: "Using a queue to absorb bursts so workers process at a sustainable rate.", lesson: "diwali-scale" },
+  { term: "Token bucket", def: "A rate-limiting algorithm with a bucket of tokens that refills at a fixed rate.", lesson: "diwali-scale" },
+  { term: "Connection pooler", def: "A proxy such as PgBouncer that multiplexes many clients onto few database connections.", lesson: "diwali-scale" },
+  { term: "Partitioning", def: "Splitting a large table into smaller pieces, such as by month, within one database.", lesson: "diwali-scale" },
+  { term: "Sharding", def: "Splitting data across several independent databases by a shard key.", lesson: "diwali-scale" },
+  { term: "RPO and RTO", def: "Recovery point objective (data you can lose) and recovery time objective (downtime you can accept).", lesson: "diwali-scale" },
+  { term: "CAP theorem", def: "During a network partition, a system must choose consistency or availability for each operation.", lesson: "diwali-scale" },
+  { term: "PACELC", def: "An extension of CAP: else, without a partition, you trade latency against consistency.", lesson: "diwali-scale" },
+  { term: "Eventual consistency", def: "Replicas may disagree briefly but converge to the same value.", lesson: "diwali-scale" },
+  { term: "Circuit breaker", def: "A wrapper that stops calling a failing dependency for a while, then tests it before resuming.", lesson: "diwali-scale" },
+  { term: "Graceful degradation", def: "Getting worse instead of stopping when a dependency fails.", lesson: "diwali-scale" },
+  { term: "SLI, SLO and SLA", def: "An indicator of user experience, a target for it, and a contractual promise about it.", lesson: "diwali-scale" },
+  { term: "Error budget", def: "The amount of failure an SLO allows over its window, such as 43 minutes at 99.9% over 30 days.", lesson: "diwali-scale" },
+
+  // Lesson 19
+  { term: "Offline-first", def: "An app design where the UI reads and writes a local database and syncs in the background.", lesson: "frontend-and-mobile" },
+  { term: "Sync engine", def: "The component that pushes local operations to the server and pulls remote changes.", lesson: "frontend-and-mobile" },
+  { term: "Last-write-wins", def: "A conflict strategy where the most recent write replaces earlier ones.", lesson: "frontend-and-mobile" },
+  { term: "CRDT", def: "Conflict-free replicated data type: a data structure that merges concurrent edits automatically.", lesson: "frontend-and-mobile" },
+  { term: "Optimistic UI", def: "Updating the screen before the server confirms, and correcting it if needed.", lesson: "frontend-and-mobile" },
+  { term: "Push notification", def: "A message delivered to a device by FCM or APNs to wake the app; best effort, not a data channel.", lesson: "frontend-and-mobile" },
+  { term: "SSE", def: "Server-Sent Events: a one-way stream of events from server to browser over HTTP.", lesson: "frontend-and-mobile" },
+  { term: "WebSocket", def: "A persistent two-way connection between client and server.", lesson: "frontend-and-mobile" },
+  { term: "SSR, CSR and static", def: "Rendering HTML on the server per request, in the browser, or at build time.", lesson: "frontend-and-mobile" },
+  { term: "React Server Components", def: "React components that render on the server and send HTML and data, not their code, to the browser.", lesson: "frontend-and-mobile" },
+  { term: "Over-the-air update", def: "Updating a React Native app's JavaScript bundle without a store release.", lesson: "frontend-and-mobile" },
+
+  // Lesson 20
+  { term: "CI/CD", def: "Continuous integration (automatic build and test of every change) and continuous delivery (automated release).", lesson: "ship-it" },
+  { term: "Expand and contract", def: "Changing a schema in backward-compatible steps so old and new code can run together.", lesson: "ship-it" },
+  { term: "Feature flag", def: "A runtime switch that turns behaviour on or off for chosen users without deploying code.", lesson: "ship-it" },
+  { term: "Canary release", def: "Releasing to a small slice of traffic first and widening only if metrics stay healthy.", lesson: "ship-it" },
+  { term: "Blue-green deployment", def: "Running two full environments and switching all traffic from old to new at once.", lesson: "ship-it" },
+  { term: "RED metrics", def: "Rate, errors and duration: the core health metrics for a service.", lesson: "ship-it" },
+  { term: "Runbook", def: "Written steps for diagnosing and handling a specific alert or incident.", lesson: "ship-it" },
+  { term: "Blameless postmortem", def: "An incident review focused on how the system allowed a failure, ending in concrete actions.", lesson: "ship-it" },
 ];

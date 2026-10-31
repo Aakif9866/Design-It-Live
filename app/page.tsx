@@ -136,7 +136,7 @@ export default function Home() {
               concept appears because DukaanVoice just hit the problem it solves: a Diwali traffic spike, a double-charged customer, an AI bill bigger than the
               revenue.
             </p>
-            <p>About 60% of the reading is AI system design. The rest is the distributed-systems core every engineer is expected to know.</p>
+            <p>More than half of the reading is AI system design. The rest is the distributed-systems core every engineer is expected to know.</p>
           </div>
         </section>
 

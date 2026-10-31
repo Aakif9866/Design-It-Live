@@ -1,3 +1,274 @@
 ## The problem
 
-Coming soon.
+Two years in, DukaanVoice has 25 engineers, and a new kind of problem. On a Friday at 6 pm, a well-tested change to the extraction prompt went out to all 50,000 shops at once. It passed every offline eval. On real traffic, it raised the correction rate for shops in Tamil Nadu from 3% to 5%, because the eval set had only 40 Tamil examples. It took 50 minutes to notice (a shopkeeper's tweet), and another 40 to roll back, because the prompt was compiled into the worker image and rolling back meant a full redeploy during the evening peak. The person who noticed was Anjali, on holiday, because there was no on-call rotation.
+
+Nothing in the architecture was wrong. What was missing was the machinery for **shipping changes safely**: getting code, prompts and models from a laptop to 50,000 shops without betting the business on each release.
+
+This last lesson covers that machinery, puts the complete DukaanVoice architecture on one page, and turns the whole weekend into a framework you can use in any system design interview.
+
+## CI/CD: every change through the same gate
+
+**Continuous integration** (CI) means every change is automatically built and tested when it is proposed. **Continuous delivery** (CD) means every change that passes can be released through an automated, repeatable pipeline. For DukaanVoice the pipeline looks like this:
+
+<Diagram
+  fig="20.1"
+  caption="The delivery pipeline. One artifact is built once and promoted through stages; AI changes get their own gates."
+  label="Delivery pipeline: a pull request runs type checks, linting, unit tests, integration tests against a real Postgres, the cross-tenant isolation suite, a migration safety check and the fast eval suite. After merge, one container image is built and deployed to staging, where smoke tests run. Production rollout starts as a canary for 5% of shops, with automatic checks on errors, latency, correction rate and cost, then widens to 25% and 100%, or rolls back automatically."
+  chart={`flowchart TD
+  PR["Pull request"] --> CI["Typecheck, lint, unit tests"]
+  CI --> IT["Integration tests on real Postgres"]
+  IT --> XT["Cross-tenant isolation suite"]
+  XT --> MG["Migration safety check"]
+  MG --> EV["Fast eval suite, per-slice gates"]
+  EV --> M["Merge"]
+  M --> B["Build one image"]
+  B --> ST["Staging and smoke tests"]
+  ST --> C5["Canary: 5% of shops"]
+  C5 -->|"healthy for 2 hours"| C25["25% of shops"]
+  C25 -->|"healthy"| ALL["100%"]
+  C5 -->|"alarm"| RB["Automatic rollback"]
+  C25 -->|"alarm"| RB
+`}
+/>
+
+A few principles behind it:
+
+- **Build once, promote the same artifact.** The image tested in staging is byte-for-byte the image running in production. Rebuilding per environment invites "works in staging" surprises.
+- **Test against real dependencies where it matters.** Integration tests run against a real Postgres in a container, because row-level security, constraints and locking behaviour (lessons 4 and 5) are exactly what mocks get wrong.
+- **AI changes go through AI gates.** The per-slice eval suite from lesson 15, with cost and latency, runs on any change to prompts, model routes, retrieval or schemas.
+
+### Migrations that never break running code
+
+During a rollout, old and new versions of the code run at the same time, against the same database. So every schema change must work with both. The standard technique is **expand and contract**:
+
+1. **Expand:** add the new column or table, nullable or with a default. Old code ignores it.
+2. **Migrate:** deploy code that writes to both old and new, backfill existing rows in small batches, then switch reads to the new column.
+3. **Contract:** once no running code uses the old column, remove it in a later release.
+
+Renaming `price` to `price_paise` this way takes three releases instead of one. It also never takes the order flow down. A migration that locks a 200-million-row table during the evening peak is an outage you scheduled yourself; the migration safety check in CI flags operations that take heavy locks on large tables.
+
+## Feature flags: separate deploy from release
+
+A **feature flag** is a switch, checked at runtime, that turns behaviour on or off without deploying code. Flags let you **deploy** code dark (present but inactive) and **release** it later, to chosen users, by changing configuration.
+
+DukaanVoice flags target by shop, by percentage of shops, by region, by language and by app version:
+
+```ts title="flags/extraction.ts"
+// Prompt and model choices are configuration behind flags, not constants compiled into the image.
+export function extractionConfig(shop: Shop): { promptVersion: number; route: string } {
+  if (flags.isOn("extraction_prompt_v17", { shopId: shop.id, region: shop.state, languages: shop.languages })) {
+    return { promptVersion: 17, route: "extract_items_v2" };
+  }
+  return { promptVersion: 16, route: "extract_items" };
+}
+// Rollback = flip the flag. Takes effect in seconds, no redeploy, works during peak.
+```
+
+With prompts and model routes behind flags, the Friday incident would have been a rollout to 5% of shops, an alarm on the Tamil Nadu slice within the hour, and a rollback by flipping one switch.
+
+Flags also provide **kill switches** for risky features (turn off voice replies platform-wide in one click) and the version-specific behaviour from lesson 19. Flags have a cost: every flag doubles the paths through the code. Give each one an owner and an expiry date, and delete it once the rollout is complete.
+
+## Canary rollouts
+
+A **canary** release sends a new version to a small slice of real traffic first, compares its metrics with the current version, and widens the rollout only if it is healthy. The alternative, **blue-green** deployment, runs two complete environments and switches all traffic from old (blue) to new (green) at once, keeping the old one ready for an instant switch back.
+
+For AI changes, canaries are the better default, for a specific reason: AI regressions are **statistical**. A bad prompt does not crash; it is wrong 2% more often. Blue-green would expose every shop to that 2% at once. A canary exposes 5% of shops, and if the canary group's correction rate rises compared to the control group, rollback is automatic.
+
+The canary's health checks therefore include AI metrics alongside the usual ones:
+
+- Error rate and p95 latency (the usual).
+- Correction rate and clarification rate per language slice, compared with the control group.
+- Escalation rate and cost per order (lesson 17).
+- Dead-letter rate.
+
+Quality metrics like correction rate need volume and time to be meaningful: hundreds of orders per slice, and a couple of hours. Plan rollouts for that, and avoid starting one just before the evening peak.
+
+<Decision id="canary-vs-bluegreen" />
+
+## Observability: logs, metrics, traces
+
+Lesson 15 introduced tracing for AI calls. Production observability rests on three kinds of signal, each answering a different question:
+
+- **Metrics** answer "is something wrong?" They are cheap numeric time series: request rate, error rate and duration for every service (often called the **RED** method), utilisation and saturation for resources like the database and queues, and **business metrics** like orders per minute and confirmation rate. Business metrics often catch problems that technical metrics miss.
+- **Traces** answer "where is it wrong?" One voice note followed through every service and model call, with timings (lesson 15).
+- **Logs** answer "what exactly happened?" Structured JSON lines with the trace ID, shop ID and request ID on every line, redacted (lesson 16), so you can jump from a trace to the details.
+
+Two rules make observability useful rather than expensive:
+
+- **Alert on symptoms, not causes.** Page someone when users are affected: the SLO burn rate from lesson 18, the voice queue age, the correction rate. Do not page on "CPU above 80%"; it might be fine. Every alert must be actionable and link to a runbook.
+- **One overview dashboard** answers "is DukaanVoice healthy right now?" in five seconds: orders per minute against last week, voice note p95, queue ages, correction rate, cost per order, provider breaker states, load-shedding level. Detailed dashboards per service sit underneath.
+
+## On-call basics
+
+With 50,000 shops depending on you, someone must be reachable when things break, and it must not always be the same person.
+
+- **A rotation**, typically a week at a time, with a primary and a secondary, and a clear escalation path.
+- **Runbooks** for every alert: what it means, how to check, what to do. "Voice queue age above 30 s: check provider breaker states, check worker autoscaling, consider load-shedding level 2."
+- **Severity levels** that decide the response. A full outage pages immediately and gets an incident commander; one shop's broken catalog import is a next-morning ticket.
+- **Incident roles** for big incidents: an **incident commander** who coordinates and decides, separate from the people debugging, and someone handling **communication**, including a status message to shopkeepers. Shopkeepers forgive outages much more readily when they are told what is happening.
+- **Blameless postmortems** after every significant incident: what happened, why the system allowed it, and concrete action items with owners. The Friday incident's postmortem produced three: prompts behind flags, canaries with per-slice AI metrics, and an on-call rotation. Not "be more careful".
+
+## The complete DukaanVoice architecture
+
+Here is everything you designed this weekend, on one page. Every box was added in a specific lesson to solve a specific problem.
+
+<Diagram
+  fig="20.2"
+  caption="DukaanVoice at 50,000 shops. Lesson numbers in brackets show where each part was introduced."
+  label="Complete architecture. Customers on WhatsApp and the payment gateway send webhooks to ingest, which verifies signatures, deduplicates, rate limits and writes to priority queues. Voice and order workers run the pipeline: media fetch to object storage, speech-to-text, normalisation, extraction with structured outputs and tools, hybrid catalog search with reranking, and the order state machine with confirmation, stock reservation and payment links. All model calls go through the LLM gateway with routing, fallbacks, cascades, quotas, caching and circuit breakers to multiple providers. Postgres with row-level security, partitions, a connection pooler and read replicas, Redis for cache and limits, pgvector for embeddings, and an outbox relay feeding notification and embedding queues. The analytics agent uses read-only tools on replicas. The shopkeeper app is offline-first with sync and push; the dashboard streams answers over SSE. Observability, evals and feature flags span everything."
+  chart={`flowchart TD
+  subgraph IN["Ingest (3, 7, 16, 18)"]
+    CU["Customers on WhatsApp"] --> WA["WhatsApp Cloud API"]
+    WA --> ING["Ingest: verify, dedupe, rate limit"]
+    PAY["Payment gateway"] --> ING
+  end
+  ING --> QS[("Priority queues (7, 18)")]
+  subgraph WK["Workers (7, 9, 11, 13)"]
+    QS --> VP["Voice pipeline: fetch, STT, normalise"]
+    VP --> EX["Extraction: schema, tools, validation"]
+    EX --> SM["Order state machine: confirm, reserve, pay"]
+  end
+  VP --> S3[("Object storage, 30-day audio (5, 16)")]
+  EX --> SR["Hybrid search and reranker (12)"]
+  EX --> GW["LLM gateway: routes, fallbacks, cascades, quotas, cache (10, 17)"]
+  GW --> PR["Model and STT providers"]
+  SM --> PGB["PgBouncer (18)"]
+  SR --> PGB
+  PGB --> PG[("Postgres: RLS, partitions, pgvector (4, 12, 18)")]
+  PG -.-> RR[("Read replicas (6)")]
+  SM --> OB[("Outbox (7)")]
+  OB --> NQ["Notifications and embedding updates (7, 12)"]
+  RD[("Redis: cache, sessions, limits (6, 18)")]
+  ING --> RD
+  subgraph SK["Shopkeeper (13, 19)"]
+    APP["Offline-first app"] --> API["REST API /v1 (3, 5)"]
+    DASH["Next.js dashboard, SSE"] --> API
+    API --> AG["Analytics agent, read-only tools"]
+  end
+  AG --> RR
+  API --> PGB
+  NQ --> APP
+`}
+/>
+
+And around all of it, not drawn as boxes: the evaluation system and golden dataset (lesson 15), tracing and dashboards (lessons 15 and 20), guardrails and the data map (lesson 16), cost budgets (lesson 17), SLOs and the load-shedding ladder (lesson 18), and the delivery pipeline with flags and canaries (this lesson).
+
+Compare it with lesson 3's diagram: one API, one database, one bucket. Every addition since then was a response to a named problem. That is the story to tell in an interview.
+
+## The interview playbook
+
+A system design interview is usually 45 to 60 minutes, and the interviewer is assessing how you think, not whether you reach a particular diagram. Here is a framework that works for almost any prompt, with the DukaanVoice lessons that taught each step.
+
+**1. Clarify requirements (about 5 minutes).** Ask who the users are and what they do: the functional requirements. Then the non-functional ones: scale, latency, availability, consistency, cost, privacy. Ask what must never go wrong. Write the answers down where the interviewer can see them. *(Lesson 2)*
+
+**2. Estimate (about 5 minutes).** Users to actions per day to requests per second, then peak. Storage, split into rows and blobs. For AI products: tokens per request and cost per unit compared with revenue per unit. Finish with a conclusion: "so the bottleneck will be X, not Y". *(Lesson 2)*
+
+**3. API and data model (5 to 10 minutes).** The main endpoints or events, the core entities and the access patterns that drive indexes. Mention IDs, idempotency and tenancy here if they matter; it signals experience. *(Lessons 3, 4, 5)*
+
+**4. A simple high-level design (about 10 minutes).** Draw the simplest design that meets the functional requirements, and walk one request through it end to end. Say what you are deliberately leaving out for now. *(Lesson 3)*
+
+**5. Deep dives (15 to 20 minutes).** Pick the two or three hardest parts, guided by your estimates and by what the interviewer seems interested in, and go deep: concurrency and correctness, the async pipeline, caching, the AI pipeline. For each, state the options, the trade-off and your choice for this system, as in a decision card. *(Lessons 6 to 17)*
+
+**6. Scale and failure (5 to 10 minutes).** What happens at 10 times the load? What happens when each dependency is slow or down? Queues, backpressure, sharding, circuit breakers, degradation, consistency per feature, SLOs. *(Lessons 7, 18)*
+
+**7. For AI systems, the extra checklist.** Model choice by task and a gateway with fallbacks; structured outputs and validation; retrieval with tenant filters; workflow versus agent; evals and online quality metrics; guardrails and injection; cost per unit. Interviewers increasingly ask about these, and very few candidates cover them systematically. *(Lessons 8 to 17)*
+
+**8. Wrap up (2 minutes).** Summarise the design in three sentences, name the biggest risks, and say what you would build next. *(This lesson)*
+
+Some habits that make a large difference throughout:
+
+- **Think aloud and check in.** "I'm going to assume read-heavy traffic, does that match what you had in mind?" Interviewers cannot give credit for reasoning they cannot hear.
+- **Name trade-offs explicitly.** "Choose A when, choose B when, and here I choose A because" is the most valuable sentence pattern in system design.
+- **Use numbers.** "About 1,000 messages per second at peak" beats "a lot of traffic" every time.
+- **Do not over-build.** Adding Kafka, Kubernetes and five microservices to a system with 20 requests per second suggests you cannot size problems.
+
+### Practising with new prompts
+
+The framework transfers. Some prompts to practise on, with the lessons that carry over:
+
+| Prompt | Lessons that do the heavy lifting |
+| --- | --- |
+| An AI support assistant for a bank | Gateway (10), structured tools (11), RAG with strict filters (12), guardrails and PII (16), evals (15) |
+| A food delivery order system | Data model and locking (4), idempotency (5), async and outbox (7), Diwali-style spikes (18), offline apps (19) |
+| A WhatsApp appointment booker for clinics | Webhooks (3, 7), state machines (13), privacy law (16), consistency for slots (4, 18) |
+| An internal "ask our docs" assistant | RAG (12), context engineering (14), evals and judges (15), cost (17) |
+| A notification service for millions of users | Queues, retries and DLQs (7), rate limiting (18), push delivery (19), SLOs (18) |
+
+## Every decision, on one page
+
+Here is every decision card from the course with DukaanVoice's default. The full cards, with the "choose A when, choose B when" reasoning, are on the [cheat sheet](/cheatsheet).
+
+<DecisionRecap />
+
+## What the architecture looks like now
+
+It looks like Fig 20.2. More importantly, it has a process around it: every change goes through CI with evals, every risky behaviour sits behind a flag, every release starts as a canary watched on AI quality metrics, every alert has a runbook and an owner, and every incident ends in a blameless postmortem. That process is what lets 25 engineers keep changing a system that 50,000 shops depend on.
+
+You started this weekend with a shopkeeper in Kukatpally drowning in voice notes. You have designed the system that answers them: from one server and one database, through queues, caches, gateways, retrieval, agents, evals, guardrails and Diwali night, to a platform that ships safely. Mark this lesson done, then read the cheat sheet once more before your next interview.
+
+## Interview angle
+
+<Interview
+  ask="How would you roll out a change to the AI model or prompt safely?"
+  mistake="“We test it offline and then deploy it.” Offline evals miss real-world slices, and deploying to everyone at once turns a statistical regression into a full incident."
+>
+
+- Offline evals in CI as the first gate, with per-slice thresholds, cost and latency.
+- Prompts and model routes as configuration behind feature flags, so rollback takes seconds and needs no redeploy.
+- A canary to a small percentage of tenants, compared against a control group on AI metrics (correction rate, escalation rate, cost) as well as errors and latency, with automatic rollback.
+- Enough time and volume for quality metrics to be meaningful, and no rollouts into peak hours or during a change freeze.
+- Observability and an on-call process so someone notices and acts when a canary goes wrong.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Build once and promote the same artifact through CI, staging and a gradual production rollout; use expand-and-contract migrations so old and new code can run together.
+- Feature flags separate deploying from releasing. Put prompts and model routes behind them so rollback is instant.
+- Canary AI changes and watch quality metrics per slice, not just errors and latency; AI regressions are statistical.
+- Metrics say whether something is wrong, traces say where, logs say what. Alert on user-facing symptoms, with runbooks, a rotation and blameless postmortems.
+- In interviews: clarify, estimate, design simply, deep-dive on the hard parts, cover scale and failure, add the AI checklist, and name every trade-off.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "You need to rename the column `price` to `price_paise` on a live table while code is rolling out gradually. What is the safe approach?",
+      options: [
+        "Rename the column in one migration during a quiet hour",
+        "Stop all traffic, run the rename, then deploy the new code",
+        "Rename it in the ORM only and leave the database alone",
+        "Expand and contract: add the new column, write to both and backfill, switch reads, and remove the old column in a later release",
+      ],
+      answer: "D",
+      why: "During a rollout, old and new code run at the same time, so a single rename breaks whichever version expects the other name. Stopping traffic is an outage, and an ORM-only rename leaves the code and schema disagreeing.",
+    },
+    {
+      q: "Why is a canary rollout especially valuable for prompt and model changes?",
+      options: [
+        "Canaries make prompts run faster on the new model",
+        "AI regressions are usually statistical (a small rise in wrong answers), so you need a limited exposure and a comparison with a control group to detect them safely",
+        "Blue-green deployments cannot deploy prompt changes",
+        "Canaries remove the need for offline evals",
+      ],
+      answer: "B",
+      why: "A bad prompt rarely crashes; it is wrong slightly more often, and only real traffic per slice reveals it. A canary limits who is affected while you measure. It does not change speed, blue-green can deploy prompts (just with all-at-once exposure), and offline evals remain the first gate.",
+    },
+    {
+      q: "In the interview framework, what should you do right after clarifying the requirements?",
+      options: [
+        "Draw the most scalable architecture you know, then simplify it",
+        "Choose the database technology",
+        "Estimate scale: requests per second at peak, storage, and for AI products, cost per unit compared with revenue",
+        "Start the deep dive on the hardest component",
+      ],
+      answer: "C",
+      why: "Estimates tell you which parts of the design matter and anchor every later decision in numbers. Choosing technology or deep-diving before you know the scale leads to designs that are over- or under-built, and starting from a maximal architecture is the classic mistake.",
+    },
+  ]}
+/>

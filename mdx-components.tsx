@@ -1,7 +1,7 @@
 import type { MDXComponents } from "mdx/types";
 import type { ReactNode } from "react";
 import { Children, isValidElement } from "react";
-import { Callout, Decision, Interview, Takeaways } from "@/components/content";
+import { Callout, Decision, DecisionRecap, Interview, Takeaways } from "@/components/content";
 import { Diagram } from "@/components/Diagram";
 import { Quiz } from "@/components/Quiz";
 import { slugify } from "@/lib/slug";
@@ -30,6 +30,7 @@ const components: MDXComponents = {
   ),
   Diagram,
   Decision,
+  DecisionRecap,
   Interview,
   Takeaways,
   Callout,
