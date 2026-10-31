@@ -4,11 +4,11 @@ It is 7:40 on a Tuesday evening in Kukatpally, Hyderabad. Ravi runs Sri Lakshmi 
 
 Ravi does not need a new app. His customers already use WhatsApp, and they are not going to install anything. What he needs is an assistant that listens to those voice notes, works out what people want, checks whether he has it, builds the order, asks the customer to confirm, sends a UPI (Unified Payments Interface) payment link, and pings his phone when it is paid.
 
-That assistant is **DukaanVoice**, and for the next two days you are going to design it. Not a toy version. You will take it from 20 shops in one city to 50,000 shops across India, through a Diwali night when traffic is ten times normal, while keeping the AI bill per order smaller than the price of a toffee.
+That assistant is **DukaanVoice**, and over this course you are going to design it. Not a toy version. You will take it from 20 shops in one city to 50,000 shops across India, through a Diwali night when traffic is ten times normal, while keeping the AI bill per order smaller than the price of a toffee.
 
 ## How this course works
 
-This is a reading course. There is nothing to install and no exercises to submit. You will see short TypeScript snippets, but only to make an idea concrete; you never need to run them. Plan for about **6 hours 40 minutes of reading**, including time for diagrams and quizzes, split across Saturday and Sunday.
+This is a reading course. There is nothing to install and no exercises to submit. You will see short TypeScript snippets, but only to make an idea concrete; you never need to run them. Plan for about **6 hours 40 minutes of reading** in total, including time for diagrams and quizzes. Read at whatever pace suits you.
 
 You already know a lot of what system design is built on. You have written Express servers, modelled data in MongoDB, built React apps and used Git every day. You have solved enough algorithm problems to know what an index or a hash map buys you. System design is mostly about what happens when those pieces meet the real world: more users than one machine can handle, networks that fail, third-party services that are slow, and data that has to stay correct while all of that is going on.
 
@@ -26,16 +26,15 @@ Every lesson has the same shape, so you always know where you are:
 
 Each lesson ends with a "Mark as done" button. Your progress is saved in this browser, and the sidebar and home page show where you left off.
 
-## The weekend plan
+## How the course is organised
 
-The [weekend plan](/plan) has exact times and breaks, but here is the shape:
+The course has three parts. The [study plan](/plan) lists every lesson with a running total, and the end of each part is a natural place to stop.
 
-| When | What | Time |
+| Part | What | Time |
 | --- | --- | --- |
-| Saturday morning | Part A: foundations, lessons 1 to 7 | about 2 h 10 min |
-| Saturday afternoon | Part B begins: LLMs, voice, the gateway, lessons 8 to 10 | about 1 h |
-| Sunday morning | Part B continues: tools, RAG, agents, evals, safety, cost, lessons 11 to 17 | about 2 h 20 min |
-| Sunday afternoon | Part C: scale, mobile, shipping and the interview playbook, lessons 18 to 20 | about 1 h 10 min |
+| A: Foundations | Requirements, data modelling, early decisions, caching and async systems, lessons 1 to 7 | about 2 h 10 min |
+| B: AI systems | LLMs, voice, the gateway, tools, RAG, agents, context, evals, safety and cost, lessons 8 to 17 | about 3 h 20 min |
+| C: Scale, mobile and shipping | Traffic spikes, frontend and mobile, shipping and the interview playbook, lessons 18 to 20 | about 1 h 10 min |
 
 More than half of the time is on AI system design: how products built on large language models (LLMs) are engineered in production, with real concerns like latency, cost, reliability and safety. The rest is the core distributed-systems knowledge every software engineer is expected to have. They are not separate subjects. An AI product is a normal distributed system with one very unusual dependency in the middle, and most of the hard problems are the normal ones.
 
@@ -59,7 +58,7 @@ And here is the pressure it lives under, which will drive almost every decision 
 
 <Diagram
   fig="1.1"
-  caption="Where you will end up on Sunday night. Every box here gets its own lesson."
+  caption="Where you will end up by lesson 20. Every box here gets its own lesson."
   label="Simplified DukaanVoice end-state architecture: WhatsApp and the payment gateway send webhooks to an ingest service, which puts jobs on a queue. Workers run the voice pipeline through an LLM gateway to model providers, and use Postgres, Redis and a vector index. The shopkeeper app and dashboard talk to the API."
   chart={`flowchart TD
   C["Customer on WhatsApp"] -->|voice note| WA["WhatsApp Cloud API"]
@@ -79,7 +78,7 @@ And here is the pressure it lives under, which will drive almost every decision 
 `}
 />
 
-Do not try to understand that diagram yet. On Saturday morning, DukaanVoice is a single Node.js server and one database, and that is the right design for 20 shops. Each box above appears only when the product hits a problem that needs it. That is the most important habit this course teaches: **add a component when a specific problem demands it, and be able to name that problem.**
+Do not try to understand that diagram yet. At the start, DukaanVoice is a single Node.js server and one database, and that is the right design for 20 shops. Each box above appears only when the product hits a problem that needs it. That is the most important habit this course teaches: **add a component when a specific problem demands it, and be able to name that problem.**
 
 ## The DukaanVoice timeline
 
@@ -116,7 +115,7 @@ This course follows exactly that path. By lesson 20 you will have rehearsed it t
 
 <Takeaways>
 
-- DukaanVoice is one product followed for the whole weekend: a WhatsApp voice-ordering assistant for Indian local shops.
+- DukaanVoice is one product followed for the whole course: a WhatsApp voice-ordering assistant for Indian local shops.
 - The constraints (festival spikes, bad networks, tiny margins, many tenants, money, privacy law) drive the design more than the features do.
 - Good designs grow: start boring, and add each component only when you can name the problem it solves.
 - AI system design is ordinary distributed-systems engineering around one slow, expensive, unpredictable dependency.

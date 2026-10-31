@@ -1,6 +1,6 @@
 export const SITE_NAME = "Design It Live";
 export const SITE_DESCRIPTION =
-  "A weekend system design course for developers: six hours of reading that follows one AI product, DukaanVoice, from 20 shops to millions of orders.";
+  "A self-paced system design course for developers: about six and a half hours of reading that follows one AI product from a 20-shop pilot to millions of orders.";
 
 export const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL ??

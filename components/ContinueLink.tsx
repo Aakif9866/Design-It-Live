@@ -12,7 +12,7 @@ export function ContinueLink() {
   if (doneCount === 0) {
     return (
       <Link href={`/lessons/${LESSONS[0].slug}`} className="button" data-variant="primary">
-        Start Saturday
+        Start lesson 1
       </Link>
     );
   }

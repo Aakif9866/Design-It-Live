@@ -3,12 +3,10 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { LESSONS, type Day } from "@/lib/course";
+import { LESSONS, PARTS, PART_IDS, partLessons } from "@/lib/course";
 import type { Heading } from "@/lib/headings";
 import { useDone } from "@/lib/progress";
 import { ThemeToggle } from "./ThemeToggle";
-
-const DAYS: Day[] = ["Saturday", "Sunday"];
 
 export function Sidebar({ headings }: { headings: Record<string, Heading[]> }) {
   const pathname = usePathname();
@@ -54,11 +52,13 @@ export function Sidebar({ headings }: { headings: Record<string, Heading[]> }) {
           </div>
         </div>
         <nav onClick={(e) => (e.target as HTMLElement).closest("a") && setOpen(false)}>
-          {DAYS.map((day) => (
-            <div key={day} className="nav-day">
-              <p className="nav-day-title">{day}</p>
+          {PART_IDS.map((part) => (
+            <div key={part} className="nav-day">
+              <p className="nav-day-title">
+                Part {part}: {PARTS[part]}
+              </p>
               <ol className="nav-lessons">
-                {LESSONS.filter((l) => l.day === day).map((l) => {
+                {partLessons(part).map((l) => {
                   const isCurrent = current?.slug === l.slug;
                   const isDone = done.includes(l.slug);
                   return (
@@ -90,7 +90,7 @@ export function Sidebar({ headings }: { headings: Record<string, Heading[]> }) {
           <ul className="nav-extra">
             <li>
               <Link href="/plan" aria-current={pathname === "/plan" ? "page" : undefined}>
-                Weekend plan
+                Study plan
               </Link>
             </li>
             <li>

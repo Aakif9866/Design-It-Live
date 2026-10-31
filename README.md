@@ -1,10 +1,10 @@
 # Design It Live
 
-A weekend system design course for developers, built as a fast, fully static Next.js site.
+A self-paced system design course for developers, built as a fast, fully static Next.js site.
 
-Twenty lessons follow one fictional AI product, **DukaanVoice**, a WhatsApp voice-ordering assistant for Indian kirana stores, from a 20-shop pilot to 50,000 shops and a Diwali night at ten times normal traffic. Every concept (queues, caching, idempotency, LLM gateways, RAG, agents, evals, guardrails, cost, sharding, offline-first apps) appears at the moment the product needs it.
+Twenty lessons follow one fictional AI product, **DukaanVoice**, a voice-ordering assistant for small neighbourhood shops, from a 20-shop pilot to 50,000 shops and a festival night at ten times normal traffic. Every concept (queues, caching, idempotency, LLM gateways, RAG, agents, evals, guardrails, cost, sharding, offline-first apps) appears at the moment the product needs it.
 
-- About **6 h 40 min** of reading (~54,000 words), split across Saturday and Sunday
+- About **6 h 40 min** of reading (~54,000 words) in three parts, at your own pace
 - Reading only: no setup, no exercises
 - More than half on AI system design, the rest on core distributed systems
 - Every lesson has diagrams, short TypeScript snippets, decision cards, an interview angle, takeaways and a 3-question quiz
@@ -17,30 +17,30 @@ Twenty lessons follow one fictional AI product, **DukaanVoice**, a WhatsApp voic
 
 ## Lessons
 
-| # | Lesson | Day | Minutes |
+| # | Lesson | Part | Minutes |
 | --- | --- | --- | --- |
-| 1 | Welcome, and meet DukaanVoice | Saturday | 14 |
-| 2 | Thinking like a system designer | Saturday | 20 |
-| 3 | The boring v1 | Saturday | 18 |
-| 4 | Data modeling that survives growth | Saturday | 20 |
-| 5 | Small decisions, huge consequences | Saturday | 24 |
-| 6 | Caching and read scaling | Saturday | 16 |
-| 7 | Async systems: queues, workers, webhooks | Saturday | 20 |
-| 8 | LLMs as a system component | Saturday | 19 |
-| 9 | The voice pipeline | Saturday | 20 |
-| 10 | The LLM gateway | Saturday | 21 |
-| 11 | Structured outputs and tool calling | Sunday | 19 |
-| 12 | RAG done right | Sunday | 22 |
-| 13 | Agents vs workflows | Sunday | 20 |
-| 14 | Context engineering and memory | Sunday | 17 |
-| 15 | Evals and AI observability | Sunday | 19 |
-| 16 | Safety, guardrails and privacy | Sunday | 22 |
-| 17 | AI cost engineering | Sunday | 21 |
-| 18 | Diwali night: scaling to millions | Sunday | 25 |
-| 19 | Frontend and mobile decisions that matter | Sunday | 22 |
-| 20 | Ship it, and the interview playbook | Sunday | 23 |
+| 1 | Welcome, and meet DukaanVoice | A | 14 |
+| 2 | Thinking like a system designer | A | 20 |
+| 3 | The boring v1 | A | 18 |
+| 4 | Data modeling that survives growth | A | 20 |
+| 5 | Small decisions, huge consequences | A | 24 |
+| 6 | Caching and read scaling | A | 16 |
+| 7 | Async systems: queues, workers, webhooks | A | 20 |
+| 8 | LLMs as a system component | B | 19 |
+| 9 | The voice pipeline | B | 20 |
+| 10 | The LLM gateway | B | 21 |
+| 11 | Structured outputs and tool calling | B | 19 |
+| 12 | RAG done right | B | 22 |
+| 13 | Agents vs workflows | B | 20 |
+| 14 | Context engineering and memory | B | 17 |
+| 15 | Evals and AI observability | B | 19 |
+| 16 | Safety, guardrails and privacy | B | 22 |
+| 17 | AI cost engineering | B | 21 |
+| 18 | Diwali night: scaling to millions | C | 25 |
+| 19 | Frontend and mobile decisions that matter | C | 22 |
+| 20 | Ship it, and the interview playbook | C | 23 |
 
-Saturday: 3 h 12 min. Sunday: 3 h 30 min. The site also has a weekend plan with start times and breaks, a cheat sheet of all 40 decision cards, and a glossary of 182 terms.
+Part A: 2 h 12 min. Part B: 3 h 20 min. Part C: 1 h 10 min. The site also has a study plan with a running total, a cheat sheet of all 40 decision cards, and a glossary of 182 terms.
 
 ## Run it locally
 
@@ -83,7 +83,7 @@ Progress is stored only in the reader's browser (`localStorage`). There is no ba
 ## Add or edit a lesson
 
 1. **Edit text:** open `content/lessons/NN-slug.mdx`. It is Markdown plus a few components. In prose, avoid a bare `<` or `{` (MDX treats them as JSX); write "under 200 ms" instead of "< 200 ms", or use inline code.
-2. **Add a lesson:** add an entry to `LESSONS` in `lib/course.ts` (order, slug, title, part, day, session, minutes, summary), then create `content/lessons/NN-slug.mdx` with the same number and slug. Navigation, the weekend plan, the sitemap and progress tracking pick it up automatically.
+2. **Add a lesson:** add an entry to `LESSONS` in `lib/course.ts` (order, slug, title, part, minutes, summary), then create `content/lessons/NN-slug.mdx` with the same number and slug. Navigation, the study plan, the sitemap and progress tracking pick it up automatically.
 3. **Follow the lesson structure**, which `npm run check` enforces: `## The problem`, concept sections, at least one `<Diagram>`, 1 to 3 `<Decision>` cards, `## Interview angle` with `<Interview>`, `## Key takeaways` with `<Takeaways>`, and `## Quick self-check` with a 3-question `<Quiz>`.
 4. **Components:**
 

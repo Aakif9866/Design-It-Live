@@ -43,7 +43,7 @@ export default async function LessonPage({ params }: Props) {
         </p>
         <h1>{lesson.title}</h1>
         <p className="lesson-meta">
-          Lesson {lesson.order} of {LESSONS.length}. {lesson.day} {lesson.session}, about {lesson.minutes} minutes of reading.
+          Lesson {lesson.order} of {LESSONS.length}, about {lesson.minutes} minutes of reading.
         </p>
       </header>
       <div className="prose">

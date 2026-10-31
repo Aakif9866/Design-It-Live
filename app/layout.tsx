@@ -10,14 +10,14 @@ const mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-mono", displ
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
-  title: { default: `${SITE_NAME}: system design in a weekend`, template: `%s | ${SITE_NAME}` },
+  title: { default: `${SITE_NAME}: learn system design by building one product`, template: `%s | ${SITE_NAME}` },
   description: SITE_DESCRIPTION,
   openGraph: { type: "website", siteName: SITE_NAME, title: SITE_NAME, description: SITE_DESCRIPTION, locale: "en_IN" },
   twitter: { card: "summary", title: SITE_NAME, description: SITE_DESCRIPTION },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#0F1012",
+  themeColor: "#0A0A0A",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
