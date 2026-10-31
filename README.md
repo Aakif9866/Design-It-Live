@@ -9,7 +9,7 @@ Twenty lessons follow one fictional AI product, **DukaanVoice**, a voice-orderin
 - More than half on AI system design, the rest on core distributed systems
 - Every lesson has diagrams, short TypeScript snippets, decision cards, an interview angle, takeaways and a 3-question quiz
 
-**Live site:** _add your Vercel URL here_
+**Live site:** https://design-it-live.vercel.app
 
 ![Home page](docs/screenshot-home.png)
 
