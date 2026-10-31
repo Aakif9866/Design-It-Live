@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import type { CSSProperties } from "react";
 import { MarkDone } from "@/components/MarkDone";
 import { LESSONS, PARTS, getLesson, lessonFile } from "@/lib/course";
 
@@ -32,7 +33,7 @@ export default async function LessonPage({ params }: Props) {
   const next = LESSONS[lesson.order];
 
   return (
-    <article className="lesson">
+    <article className="lesson" style={{ "--lesson": `"${String(lesson.order).padStart(2, "0")}"` } as CSSProperties}>
       <header className="lesson-head">
         <p className="lesson-num" aria-hidden="true">
           {String(lesson.order).padStart(2, "0")}

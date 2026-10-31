@@ -22,8 +22,8 @@ export function MarkDone({ slug }: { slug: string }) {
         {done ? "Mark as not done" : "Mark as done"}
       </button>
       {done && (
-        <span className="stamp stamp-done" data-animate={justStamped} aria-live="polite">
-          Done
+        <span className="done-note" data-animate={justStamped} aria-live="polite">
+          <mark>Done.</mark> Saved in this browser.
         </span>
       )}
     </div>

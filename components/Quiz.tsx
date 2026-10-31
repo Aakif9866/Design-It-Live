@@ -47,8 +47,8 @@ function QuizQuestion({ n, q, options, answer, why }: Question & { n: number }) 
                 {LETTERS[j]}
               </span>
               <span>{inline(opt)}</span>
-              {state === "correct" && <span className="sr-only"> (correct answer)</span>}
-              {state === "wrong" && <span className="sr-only"> (your answer, incorrect)</span>}
+              {state === "correct" && <span className="quiz-tag">{picked === j ? "Your answer, correct" : "Correct answer"}</span>}
+              {state === "wrong" && <span className="quiz-tag">Your answer</span>}
             </button>
           );
         })}

@@ -134,6 +134,8 @@ Every later `git push` to `main` redeploys; pull requests get preview URLs.
 
 Next.js 16 (App Router, static generation), TypeScript, MDX via `@next/mdx`, Shiki through `rehype-pretty-code` for code highlighting, Mermaid rendered client-side for diagrams, and plain CSS with a small set of design tokens. Fonts: Anek Latin, Literata and JetBrains Mono.
 
+The visual direction (dark engineer's notebook with a lime highlighter accent, plus a light mode behind a toggle) is written down in [DESIGN.md](DESIGN.md). UI work follows the antislop rules in `.claude/skills/`; see the pointer at the end of `AGENTS.md`.
+
 ## Licence
 
 - Code: [MIT](LICENSE).

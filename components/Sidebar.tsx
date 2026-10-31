@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { LESSONS, type Day } from "@/lib/course";
 import type { Heading } from "@/lib/headings";
 import { useDone } from "@/lib/progress";
+import { ThemeToggle } from "./ThemeToggle";
 
 const DAYS: Day[] = ["Saturday", "Sunday"];
 
@@ -29,15 +30,21 @@ export function Sidebar({ headings }: { headings: Record<string, Heading[]> }) {
         <Link href="/" className="brand">
           Design It Live
         </Link>
-        <button type="button" className="button" data-variant="quiet" aria-expanded={open} aria-controls="course-nav" onClick={() => setOpen(!open)}>
-          {open ? "Close lessons" : "Lessons"}
-        </button>
+        <div className="topbar-actions">
+          <ThemeToggle />
+          <button type="button" className="button" data-variant="quiet" aria-expanded={open} aria-controls="course-nav" onClick={() => setOpen(!open)}>
+            {open ? "Close" : "Lessons"}
+          </button>
+        </div>
       </div>
       {open && <div className="scrim" onClick={() => setOpen(false)} aria-hidden="true" />}
       <aside id="course-nav" className="sidebar" data-open={open} aria-label="Course">
-        <Link href="/" className="brand brand-side">
-          Design It Live
-        </Link>
+        <div className="side-top">
+          <Link href="/" className="brand">
+            Design It Live
+          </Link>
+          <ThemeToggle />
+        </div>
         <div className="progress" aria-label={`${doneCount} of ${LESSONS.length} lessons done`}>
           <p>
             {doneCount} of {LESSONS.length} lessons done

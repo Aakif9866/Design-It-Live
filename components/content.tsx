@@ -15,11 +15,14 @@ export function DecisionCard({ d }: { d: (typeof DECISIONS)[number] }) {
     <section className="decision" aria-label={`Decision: ${d.title}`}>
       <p className="decision-kicker">Decision</p>
       <h3 className="decision-title">{d.title}</h3>
-      <div className="decision-ledger">
+      <div className="decision-sides">
         <div className="decision-side">
           <p className="decision-label">Choose {d.a.label} when</p>
           <p>{inline(d.a.when)}</p>
         </div>
+        <p className="decision-or" aria-hidden="true">
+          or
+        </p>
         <div className="decision-side">
           <p className="decision-label">Choose {d.b.label} when</p>
           <p>{inline(d.b.when)}</p>
@@ -28,12 +31,10 @@ export function DecisionCard({ d }: { d: (typeof DECISIONS)[number] }) {
       <p className="decision-tradeoff">
         <strong>The trade-off:</strong> {inline(d.tradeoff)}
       </p>
-      <div className="decision-default">
-        <span className="stamp">DukaanVoice default</span>
-        <p>
-          <strong>{inline(d.pick)}.</strong> {inline(d.why)}
-        </p>
-      </div>
+      <p className="decision-default">
+        <span className="decision-label">DukaanVoice picks</span>
+        <mark>{inline(d.pick)}.</mark> {inline(d.why)}
+      </p>
     </section>
   );
 }

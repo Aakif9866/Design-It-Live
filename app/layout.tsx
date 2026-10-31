@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Anek_Latin, JetBrains_Mono, Literata } from "next/font/google";
+import { THEME_SCRIPT } from "@/components/ThemeToggle";
 import { SITE_DESCRIPTION, SITE_NAME, SITE_URL } from "@/lib/site";
 import "./globals.css";
 
@@ -16,15 +17,15 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#F4F6F7" },
-    { media: "(prefers-color-scheme: dark)", color: "#0E1B2E" },
-  ],
+  themeColor: "#0F1012",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${head.variable} ${body.variable} ${mono.variable}`}>
+    <html lang="en" data-theme="dark" suppressHydrationWarning className={`${head.variable} ${body.variable} ${mono.variable}`}>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
+      </head>
       <body>
         <a href="#main" className="skip-link">
           Skip to content

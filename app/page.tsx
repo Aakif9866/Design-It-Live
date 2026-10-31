@@ -1,29 +1,38 @@
 import Link from "next/link";
 import { ContinueLink } from "@/components/ContinueLink";
-import { LESSONS, TOTAL_MINUTES, formatMinutes, type Day } from "@/lib/course";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import { LESSONS, PARTS, TOTAL_MINUTES, formatMinutes, type Day } from "@/lib/course";
 
 const WAVE = [6, 12, 20, 14, 24, 10, 18, 26, 16, 8, 22, 12, 18, 9, 14, 20, 11, 6, 15, 9];
 
-function DayColumn({ day }: { day: Day }) {
+function DayContents({ day, blurb }: { day: Day; blurb: string }) {
   const lessons = LESSONS.filter((l) => l.day === day);
   const total = lessons.reduce((s, l) => s + l.minutes, 0);
   return (
-    <div>
-      <div className="day-head">
-        <h3>{day}</h3>
-        <span>{formatMinutes(total)}</span>
-      </div>
-      <ol className="day-list">
-        {lessons.map((l) => (
+    <section className="toc-day" aria-labelledby={`toc-${day}`}>
+      <header className="toc-head">
+        <h3 id={`toc-${day}`}>{day}</h3>
+        <p>
+          {formatMinutes(total)}. {blurb}
+        </p>
+      </header>
+      <ol className="toc-list">
+        {lessons.map((l, i) => (
           <li key={l.slug}>
-            <Link href={`/lessons/${l.slug}`}>
-              {l.order}. {l.title}
+            {(i === 0 || lessons[i - 1].part !== l.part) && (
+              <p className="toc-part">
+                Part {l.part}: {PARTS[l.part]}
+              </p>
+            )}
+            <Link href={`/lessons/${l.slug}`} className="toc-link">
+              <span className="toc-num">{String(l.order).padStart(2, "0")}</span>
+              <span className="toc-title">{l.title}</span>
+              <span className="toc-min">{l.minutes} min</span>
             </Link>
-            <span className="num">{l.minutes} min</span>
           </li>
         ))}
       </ol>
-    </div>
+    </section>
   );
 }
 
@@ -47,12 +56,15 @@ export default function Home() {
             </li>
           </ul>
         </nav>
+        <ThemeToggle />
       </header>
 
       <main id="main">
         <section className="hero">
-          <div>
-            <h1>Learn system design in one weekend, by building one product.</h1>
+          <div className="hero-text">
+            <h1>
+              Learn system design in one weekend, by <span className="swipe">building one product</span>.
+            </h1>
             <p className="hero-lede">
               Twenty lessons follow DukaanVoice, an AI assistant that turns WhatsApp voice notes into orders for Indian kirana stores, from 20 shops to two million
               orders a day. You learn each idea at the moment the product needs it.
@@ -63,21 +75,19 @@ export default function Home() {
             </p>
           </div>
 
-          <div className="demo" aria-label="Example: a customer voice note becomes an order slip">
-            <div className="demo-chat">
-              <div className="bubble">
-                <span className="bubble-who">Customer, 7:42 pm</span>
-                <span className="voice">
-                  <span className="voice-play" aria-hidden="true" />
-                  <span className="wave" aria-hidden="true">
-                    {WAVE.map((h, i) => (
-                      <span key={i} style={{ height: h }} />
-                    ))}
-                  </span>
-                  <span className="voice-time">0:08</span>
+          <figure className="demo" aria-label="Example: a customer voice note becomes an order slip">
+            <div className="bubble">
+              <span className="bubble-who">Customer, 7:42 pm</span>
+              <span className="voice">
+                <span className="voice-play" aria-hidden="true" />
+                <span className="wave" aria-hidden="true">
+                  {WAVE.map((h, i) => (
+                    <span key={i} style={{ height: h }} />
+                  ))}
                 </span>
-                <span className="transcript">“bhaiya 2 kilo atta aur ek Surf Excel bhej do”</span>
-              </div>
+                <span className="voice-time">0:08</span>
+              </span>
+              <span className="transcript">“bhaiya 2 kilo atta aur ek Surf Excel bhej do”</span>
             </div>
             <div className="slip">
               <p className="slip-head">
@@ -100,16 +110,28 @@ export default function Home() {
                   </tr>
                 </tbody>
               </table>
-              <p className="slip-foot">
-                <span>Reply 1 to confirm, 2 to change</span>
-                <span className="stamp">UPI link ready</span>
-              </p>
+              <p className="slip-foot">Reply 1 to confirm, 2 to change. UPI link follows.</p>
             </div>
+            <figcaption>What DukaanVoice does, and what you will design. The shop and order are fictional.</figcaption>
+          </figure>
+        </section>
+
+        <section className="home-toc" aria-labelledby="toc-title">
+          <div className="section-head">
+            <h2 id="toc-title">The weekend, lesson by lesson</h2>
+            <p>
+              Each lesson opens with the problem DukaanVoice just hit and ends with the architecture after fixing it. The <Link href="/plan">weekend plan</Link>{" "}
+              adds start times and breaks.
+            </p>
+          </div>
+          <div className="toc-days">
+            <DayContents day="Saturday" blurb="Foundations in the morning, the first AI lessons after lunch." />
+            <DayContents day="Sunday" blurb="The rest of the AI systems, then scale, mobile and shipping." />
           </div>
         </section>
 
-        <section className="home-section">
-          <h2>What you will be able to do by Sunday night</h2>
+        <section className="home-outcomes" aria-labelledby="outcomes-title">
+          <h2 id="outcomes-title">By Sunday night, you can</h2>
           <ol className="outcomes">
             <li>Explain how real systems handle load, failure and data correctness, from caches and queues to sharding and consistency.</li>
             <li>Spot the small early decisions in any web or mobile app that turn out to matter a lot two years later.</li>
@@ -118,16 +140,14 @@ export default function Home() {
           </ol>
         </section>
 
-        <section className="home-section home-cols">
+        <section className="home-why">
           <div>
             <h2>Who this is for</h2>
             <p>
               Developers who can build a full-stack app (an Express API, a React front end, a MongoDB or Postgres database) but have never studied system design
               formally. If you are preparing for SDE interviews or about to work on an AI product, this is the weekend to do it.
             </p>
-            <p>
-              The course builds on what you already know instead of re-teaching it, and stays plain enough that anyone who has shipped a web app can finish it.
-            </p>
+            <p>The course builds on what you already know instead of re-teaching it, and stays plain enough that anyone who has shipped a web app can finish it.</p>
           </div>
           <div>
             <h2>Why one product</h2>
@@ -140,21 +160,8 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="home-section">
-          <h2>The weekend at a glance</h2>
-          <div className="home-cols">
-            <DayColumn day="Saturday" />
-            <DayColumn day="Sunday" />
-          </div>
-          <p>
-            See the <Link href="/plan">weekend plan</Link> for suggested start times and breaks.
-          </p>
-        </section>
-
         <footer className="footer">
-          <p>
-            Design It Live. Code under the MIT licence, course text under CC BY 4.0. DukaanVoice is a fictional product invented for this course.
-          </p>
+          <p>Design It Live. Code under the MIT licence, course text under CC BY 4.0. DukaanVoice is a fictional product invented for this course.</p>
         </footer>
       </main>
     </div>

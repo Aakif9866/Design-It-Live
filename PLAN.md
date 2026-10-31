@@ -2,6 +2,8 @@
 
 ## 1. Design plan
 
+> Superseded on 2026-10-31. The frontend was rebuilt from the owner's brief in [DESIGN.md](DESIGN.md) (dark engineer's notebook, lime highlighter). This section is kept as history.
+
 ### First draft (rejected)
 
 White page, Inter for everything, one indigo accent, rounded cards with a soft grey shadow for

@@ -1,68 +1,69 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
+import { currentTheme, onThemeChange } from "./ThemeToggle";
 
 const THEMES = {
   light: {
     background: "transparent",
     primaryColor: "#FFFFFF",
-    primaryBorderColor: "#1F4FBF",
-    nodeBorder: "#1F4FBF",
+    primaryBorderColor: "#0A6A93",
+    nodeBorder: "#0A6A93",
     mainBkg: "#FFFFFF",
-    primaryTextColor: "#1A2332",
-    secondaryColor: "#FBEFD2",
-    secondaryBorderColor: "#B37A06",
-    secondaryTextColor: "#1A2332",
-    tertiaryColor: "#E8EEFA",
-    tertiaryBorderColor: "#1F4FBF",
-    tertiaryTextColor: "#1A2332",
-    lineColor: "#1F4FBF",
-    textColor: "#1A2332",
-    clusterBkg: "#EDF1F8",
-    clusterBorder: "#8FA6D6",
-    edgeLabelBackground: "#F4F6F7",
-    noteBkgColor: "#FBEFD2",
-    noteBorderColor: "#B37A06",
-    noteTextColor: "#1A2332",
+    primaryTextColor: "#151515",
+    secondaryColor: "#EFEEE8",
+    secondaryBorderColor: "#57564F",
+    secondaryTextColor: "#151515",
+    tertiaryColor: "#F1F0EB",
+    tertiaryBorderColor: "#0A6A93",
+    tertiaryTextColor: "#151515",
+    lineColor: "#0A6A93",
+    textColor: "#151515",
+    clusterBkg: "#F1F0EB",
+    clusterBorder: "#8C8A82",
+    edgeLabelBackground: "#F8F7F3",
+    noteBkgColor: "#EFEEE8",
+    noteBorderColor: "#57564F",
+    noteTextColor: "#151515",
     actorBkg: "#FFFFFF",
-    actorBorder: "#1F4FBF",
-    signalColor: "#1A2332",
-    signalTextColor: "#1A2332",
+    actorBorder: "#0A6A93",
+    signalColor: "#151515",
+    signalTextColor: "#151515",
     labelBoxBkgColor: "#FFFFFF",
-    activationBkgColor: "#E8EEFA",
-    pie1: "#1F4FBF", pie2: "#A86F00", pie3: "#2C7A4B", pie4: "#C2333A", pie5: "#7A8899", pie6: "#8FA6D6",
-    pieStrokeColor: "#FFFFFF", pieOuterStrokeColor: "#1A2332", pieSectionTextColor: "#FFFFFF", pieTitleTextColor: "#1A2332", pieLegendTextColor: "#1A2332",
+    activationBkgColor: "#E3F1F8",
+    pie1: "#0A6A93", pie2: "#B8235A", pie3: "#4D6B00", pie4: "#57564F", pie5: "#8C8A82", pie6: "#63C7F5",
+    pieStrokeColor: "#FFFFFF", pieOuterStrokeColor: "#151515", pieSectionTextColor: "#FFFFFF", pieTitleTextColor: "#151515", pieLegendTextColor: "#151515",
   },
   dark: {
     darkMode: true,
     background: "transparent",
-    primaryColor: "#132A4A",
-    primaryBorderColor: "#7FB2F0",
-    nodeBorder: "#7FB2F0",
-    mainBkg: "#132A4A",
-    primaryTextColor: "#E4ECF4",
-    secondaryColor: "#3A2F14",
-    secondaryBorderColor: "#F0B84A",
-    secondaryTextColor: "#E4ECF4",
-    tertiaryColor: "#183559",
-    tertiaryBorderColor: "#7FB2F0",
-    tertiaryTextColor: "#E4ECF4",
-    lineColor: "#7FB2F0",
-    textColor: "#E4ECF4",
-    clusterBkg: "#102440",
-    clusterBorder: "#4F7FB8",
-    edgeLabelBackground: "#0E1B2E",
-    noteBkgColor: "#3A2F14",
-    noteBorderColor: "#F0B84A",
-    noteTextColor: "#E4ECF4",
-    actorBkg: "#132A4A",
-    actorBorder: "#7FB2F0",
-    signalColor: "#E4ECF4",
-    signalTextColor: "#E4ECF4",
-    labelBoxBkgColor: "#132A4A",
-    activationBkgColor: "#183559",
-    pie1: "#7FB2F0", pie2: "#F0B84A", pie3: "#6CCB94", pie4: "#FF8F86", pie5: "#A7B6C8", pie6: "#4F7FB8",
-    pieStrokeColor: "#0E1B2E", pieOuterStrokeColor: "#E4ECF4", pieSectionTextColor: "#0E1B2E", pieTitleTextColor: "#E4ECF4", pieLegendTextColor: "#E4ECF4",
+    primaryColor: "#17191C",
+    primaryBorderColor: "#63C7F5",
+    nodeBorder: "#63C7F5",
+    mainBkg: "#17191C",
+    primaryTextColor: "#EDEBE5",
+    secondaryColor: "#202327",
+    secondaryBorderColor: "#A6A49D",
+    secondaryTextColor: "#EDEBE5",
+    tertiaryColor: "#131518",
+    tertiaryBorderColor: "#63C7F5",
+    tertiaryTextColor: "#EDEBE5",
+    lineColor: "#63C7F5",
+    textColor: "#EDEBE5",
+    clusterBkg: "#131518",
+    clusterBorder: "#4A4E55",
+    edgeLabelBackground: "#0F1012",
+    noteBkgColor: "#202327",
+    noteBorderColor: "#A6A49D",
+    noteTextColor: "#EDEBE5",
+    actorBkg: "#17191C",
+    actorBorder: "#63C7F5",
+    signalColor: "#EDEBE5",
+    signalTextColor: "#EDEBE5",
+    labelBoxBkgColor: "#17191C",
+    activationBkgColor: "#1B2A33",
+    pie1: "#63C7F5", pie2: "#FF7AA2", pie3: "#D4F55A", pie4: "#A6A49D", pie5: "#4A4E55", pie6: "#2E7FA6",
+    pieStrokeColor: "#0F1012", pieOuterStrokeColor: "#EDEBE5", pieSectionTextColor: "#0F1012", pieTitleTextColor: "#EDEBE5", pieLegendTextColor: "#EDEBE5",
   },
 };
 
@@ -76,7 +77,6 @@ export function Diagram({ chart, fig, caption, label }: { chart: string; fig: st
 
   useEffect(() => {
     let cancelled = false;
-    const dark = window.matchMedia("(prefers-color-scheme: dark)");
 
     async function draw() {
       const { default: mermaid } = await import("mermaid");
@@ -87,7 +87,7 @@ export function Diagram({ chart, fig, caption, label }: { chart: string; fig: st
         securityLevel: "strict",
         theme: "base",
         fontFamily,
-        themeVariables: { ...(dark.matches ? THEMES.dark : THEMES.light), fontFamily, fontSize: "15px" },
+        themeVariables: { ...THEMES[currentTheme()], fontFamily, fontSize: "15px" },
         flowchart: { curve: "basis", padding: 12 },
         sequence: { mirrorActors: false },
       });
@@ -108,10 +108,10 @@ export function Diagram({ chart, fig, caption, label }: { chart: string; fig: st
     }
 
     draw();
-    dark.addEventListener("change", draw);
+    const off = onThemeChange(draw);
     return () => {
       cancelled = true;
-      dark.removeEventListener("change", draw);
+      off();
     };
   }, [chart, baseId, fig]);
 
