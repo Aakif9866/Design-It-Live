@@ -1,3 +1,265 @@
 ## The problem
 
-Coming soon.
+Twenty shops in Kukatpally and Ameerpet have agreed to a six-week pilot. Ravi is one of them. The team has two engineers, Anjali and Farhan, and a hard deadline: the pilot starts the Monday before Sankranti, when grocery orders spike.
+
+Farhan has spent the weekend reading engineering blogs. He arrives with a whiteboard plan: an API gateway, separate services for orders, catalog, messaging and payments, Kafka between them, Kubernetes, a vector database, and a service mesh "so we don't have to rewrite later".
+
+Anjali asks him how many of those he has run in production. The answer is none. She asks how long it will take to build. The honest answer is "longer than six weeks". She asks what problem each box solves for 20 shops. Most boxes solve problems DukaanVoice does not have yet.
+
+This lesson is about the v1 that ships on time: deliberately boring, easy to change, and set up so it can grow without a rewrite.
+
+## Why boring wins early
+
+There is a well-known essay by Dan McKinley called "Choose Boring Technology". Its idea is that every team has a small number of **innovation tokens**: the amount of unfamiliar technology it can absorb before it spends all its time on the technology instead of on the product. Every new database, queue or framework spends one. When you are still discovering what the product is, you want to spend them on the product.
+
+"Boring" does not mean bad. It means well understood: you can search any error message, the failure modes are documented, and there are libraries for everything. Postgres, Node.js, Redis and a managed host are boring in the best way.
+
+At 20 shops and roughly 600 orders a day, DukaanVoice handles about one request every few seconds. A single small server is idle most of the time. What the team needs is **speed of change**: the order flow will be rewritten four times in six weeks as they learn how customers actually talk.
+
+## The modular monolith
+
+A **monolith** is one deployable application containing all the features. A **microservices** architecture splits features into separately deployed services that talk over the network. Your Express apps have almost certainly been monoliths, and that is fine.
+
+The problem with a careless monolith is not that it is one process. It is that everything reaches into everything else, so changing the order code breaks the catalog. A **modular monolith** fixes that with discipline instead of network calls. The code is split by business domain, each module exposes a small interface, and modules do not touch each other's tables directly.
+
+```text
+apps/
+  api/                Express API (one process)
+    src/modules/
+      messaging/      WhatsApp webhooks, sending replies
+      orders/         order lifecycle, confirmation
+      catalog/        products, prices, stock
+      payments/       UPI links, payment webhooks
+      shops/          shops, staff, settings
+    src/shared/       db client, logger, config, errors
+  dashboard/          Next.js web dashboard for shopkeepers
+  mobile/             React Native app (arrives in week 4)
+packages/
+  contracts/          shared TypeScript types and Zod schemas
+```
+
+The `orders` module calls `catalog.reserveStock(...)`, a function, not `db.query("UPDATE products ...")`. When you later need to pull `messaging` out into its own service because it has a very different traffic shape, the seam is already there. This is the main thing a monolith needs to stay splittable.
+
+<Decision id="monolith-vs-microservices" />
+
+## The v1 architecture
+
+Here is the whole of v1:
+
+<Diagram
+  fig="3.1"
+  caption="DukaanVoice v1. One API process, one database, one bucket for audio."
+  label="v1 architecture: customers on WhatsApp reach the WhatsApp Cloud API, which calls the DukaanVoice API with webhooks. The API calls a speech-to-text provider and an LLM provider, stores data in one Postgres database and audio in object storage. The shopkeeper's Next.js dashboard and React Native app call the same API."
+  chart={`flowchart TD
+  CU["Customer on WhatsApp"] --> WA["WhatsApp Cloud API"]
+  WA -->|"webhook POST"| API["DukaanVoice API (Node, Express)"]
+  API -->|"send reply"| WA
+  DASH["Next.js dashboard"] -->|"REST /v1"| API
+  MOB["React Native app"] -->|"REST /v1"| API
+  API --> DB[("Postgres")]
+  API --> S3[("Object storage: voice notes")]
+  API --> STT["Speech-to-text API"]
+  API --> LLM["LLM API"]
+  API --> PAY["Payment gateway: UPI links"]
+`}
+/>
+
+What is deliberately missing: no cache, no queue, no separate services, no vector database. Each one appears later in the course when a specific problem needs it, and you will be able to point at the exact sentence where it became necessary.
+
+What is deliberately **present**, because it is cheap now and painful later:
+
+- **Managed Postgres** with automated daily backups and point-in-time recovery turned on. Losing order data is the one mistake a pilot cannot survive.
+- **Object storage** (an S3-compatible bucket) for audio from day one, so the database never fills with blobs.
+- **Structured logs** with a request ID on every line, so "what happened to Ravi's order at 7:42?" has an answer.
+- A **staging environment** that mirrors production, with a separate WhatsApp test number.
+
+## Taking messages in: the WhatsApp webhook
+
+DukaanVoice receives customer messages through the **WhatsApp Business Platform's Cloud API**, hosted by Meta. You register a webhook URL, and Meta sends an HTTP POST to it whenever a customer messages one of your shop numbers. A **webhook** is just an HTTP request that another system makes to you when something happens, the reverse of you calling their API.
+
+There are two parts to the integration:
+
+1. **Verification.** When you register the URL, Meta sends a GET request with `hub.mode`, `hub.verify_token` and `hub.challenge` query parameters. If the token matches the one you configured, you reply with the challenge value. This proves you own the endpoint.
+2. **Events.** Every incoming message arrives as a POST with a JSON body. Text messages contain the text. Voice notes contain a **media ID**, not the audio; you call the Graph API with that ID to get a short-lived download URL, then download the file with your access token.
+
+Two platform rules shape the design. First, Meta expects a quick `200 OK`; if your endpoint is slow or errors, it **retries the delivery**, so the same message can arrive more than once. Second, you can send free-form replies only within a **24-hour customer service window** after the customer's last message; outside it, you must use pre-approved message templates. Pricing and window rules have changed several times, so check Meta's current documentation before relying on specifics.
+
+```ts title="modules/messaging/webhook.ts"
+import express from "express";
+
+export const whatsapp = express.Router();
+
+// 1. One-time verification handshake from Meta
+whatsapp.get("/webhooks/whatsapp", (req, res) => {
+  const ok = req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === process.env.WA_VERIFY_TOKEN;
+  return ok ? res.status(200).send(req.query["hub.challenge"]) : res.sendStatus(403);
+});
+
+// 2. Incoming messages
+whatsapp.post("/webhooks/whatsapp", express.json(), async (req, res) => {
+  const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  if (!msg) return res.sendStatus(200); // status updates, read receipts, etc.
+
+  // v1: handle inline. Fine for 20 shops; lesson 7 explains why this breaks.
+  await handleIncomingMessage(msg);
+  res.sendStatus(200);
+});
+```
+
+Look at the comment in that handler. In v1, the API downloads the audio, calls speech-to-text, calls the LLM and replies, all **before** answering Meta's webhook. At 20 shops it works. It is also a known shortcut, written down on purpose, with a note saying which lesson replaces it. Good v1 code is full of shortcuts like that. The skill is knowing which ones you are taking.
+
+This code also skips signature verification. Real webhooks must be authenticated so nobody can post fake orders to your endpoint. Lesson 7 adds that, along with deduplication.
+
+<Diagram
+  fig="3.2"
+  caption="The v1 message flow. Everything happens inside one webhook request, which is why it will not survive growth."
+  label="Sequence: the customer sends a voice note to WhatsApp, which posts a webhook to the API. The API fetches the media, calls speech-to-text, calls the LLM, saves the order in Postgres, sends a reply through WhatsApp, and only then returns 200 to the webhook."
+  chart={`sequenceDiagram
+  participant C as Customer
+  participant W as WhatsApp
+  participant A as API
+  participant AI as STT and LLM
+  participant D as Postgres
+  C->>W: voice note
+  W->>A: POST webhook (media id)
+  A->>W: download audio
+  A->>AI: transcribe, then understand
+  AI-->>A: items
+  A->>D: insert draft order
+  A->>W: send order summary
+  A-->>W: 200 OK (after several seconds)
+  W->>C: order summary
+`}
+/>
+
+## Designing the REST API
+
+The dashboard and the mobile app need an API: list orders, update stock, change prices. You have built REST APIs before, so here are the habits that separate a quick Express app from an API you can live with for years.
+
+### Resources, not actions
+
+Model URLs as **nouns** (resources) and use HTTP methods as the verbs. Tenant-scoped resources sit under the shop:
+
+| Method and path | Meaning |
+| --- | --- |
+| `GET /v1/shops/:shopId/orders?status=pending` | List a shop's orders, filtered |
+| `GET /v1/shops/:shopId/orders/:orderId` | Get one order |
+| `POST /v1/shops/:shopId/orders/:orderId/confirm` | Trigger a state transition |
+| `PATCH /v1/shops/:shopId/products/:productId` | Change a product's price or stock |
+| `DELETE /v1/shops/:shopId/products/:productId` | Remove a product |
+
+`confirm` looks like a verb, and that is fine. State transitions with side effects (sending a payment link, notifying the customer) read more clearly as a sub-resource action than as a `PATCH` that sets `status: "confirmed"` and quietly triggers everything.
+
+Putting `:shopId` in the path makes tenant scoping visible in every route. The server must still check that the logged-in user belongs to that shop; the URL is a claim, not proof.
+
+### Status codes mean something
+
+Use status codes precisely, because clients, proxies and monitoring all depend on them:
+
+- **200 OK** for successful reads and updates, **201 Created** with the new resource, **202 Accepted** when work was queued but not done, **204 No Content** for successful deletes.
+- **400 Bad Request** for malformed input, **422 Unprocessable Entity** for input that parses but breaks a business rule (quantity of zero), **401 Unauthorized** when not logged in, **403 Forbidden** when logged in but not allowed (another shop's order), **404 Not Found**, **409 Conflict** when the state does not allow the action (confirming a cancelled order).
+- **429 Too Many Requests** when rate limited, with a `Retry-After` header.
+- **500** for your bugs, **503 Service Unavailable** when you are deliberately shedding load.
+
+A rule worth remembering: **4xx means the client should change something; 5xx means retrying later might work.** Mobile apps and retry logic depend on that distinction. Returning 500 for a validation error makes clients retry a request that can never succeed.
+
+### One error shape everywhere
+
+Pick one error format and use it on every endpoint, so the app has one error handler instead of forty:
+
+```ts title="shared/errors.ts"
+export class ApiError extends Error {
+  constructor(public status: number, public code: string, message: string, public details?: unknown) {
+    super(message);
+  }
+}
+
+// Express error middleware: every failure leaves the API in the same shape
+export function errorHandler(err: unknown, req: any, res: any, _next: any) {
+  const e = err instanceof ApiError ? err : new ApiError(500, "internal", "Something went wrong");
+  if (e.status >= 500) req.log.error({ err }, "unhandled");
+  res.status(e.status).json({ error: { code: e.code, message: e.message, details: e.details, requestId: req.id } });
+}
+
+// throw new ApiError(409, "order_not_confirmable", "Order is already cancelled");
+```
+
+The machine-readable `code` is what the app switches on. The `message` is for humans and logs. The `requestId` lets a shopkeeper's screenshot lead you straight to the log line.
+
+### Version from the first day
+
+Put a version in the path: `/v1/...`. It costs nothing today. In lesson 5 you will see why it matters so much for a mobile app: some shopkeepers will run a two-year-old version of the app on an old Android phone, and that app will keep calling `/v1` long after you have moved on. Versioning in the URL is the most common choice because it is visible in logs and easy to route; a version header is cleaner in theory and easier to forget in practice.
+
+<Decision id="rest-vs-graphql" />
+
+## How v1 gets deployed
+
+Keep deployment as boring as the code: the API runs as one container on a managed platform with two instances behind its load balancer (two, so a deploy or a crash does not take you down), managed Postgres in the same region, and the Next.js dashboard on Vercel. Environment variables hold secrets. Database migrations run as a step in the deploy, before the new code starts. Total monthly infrastructure cost for the pilot is a few thousand rupees, which is less than one engineer-day.
+
+That is v1. It will handle the pilot comfortably, and it already has the seams (modules, versioned API, audio in object storage, request IDs) that the next nine lessons build on.
+
+## Interview angle
+
+<Interview
+  ask="Walk me through the high-level design for the first version."
+  mistake="Starting with microservices, Kafka and Kubernetes for a system with a few hundred requests a minute. It suggests you cannot size a problem, and it hides the actual design under infrastructure."
+>
+
+- A simple, complete path from input to output: client, API, database, external providers.
+- You call out the scaling bottleneck you are knowingly accepting (here: synchronous processing inside the webhook) and when you would fix it.
+- Clean API design: resource-oriented routes, correct status codes, versioning, consistent errors.
+- Modularity inside the monolith, so splitting later is a refactor and not a rewrite.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- At small scale, speed of change beats theoretical scalability. Spend your innovation tokens on the product.
+- A modular monolith gives you clean boundaries without network calls; enforce them through module interfaces, not separate deployments.
+- Webhooks are HTTP requests other systems make to you. Answer fast, expect retries and duplicates, and verify the sender (lesson 7).
+- Good REST APIs use nouns, precise status codes, one error shape and a version prefix from day one.
+- Write down the shortcuts you are taking and when they will need replacing.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "A customer tries to confirm an order that the shopkeeper already cancelled. Which status code fits best?",
+      options: [
+        "400 Bad Request, because the request should not have been sent",
+        "404 Not Found, because the order is no longer active",
+        "500 Internal Server Error, because the order flow failed",
+        "409 Conflict, because the request is valid but the resource's current state does not allow it",
+      ],
+      answer: "D",
+      why: "The request is well formed and the order exists, so 400 and 404 are wrong. 500 would tell the client to retry, which can never succeed. 409 says the state of the resource conflicts with the action.",
+    },
+    {
+      q: "What most distinguishes a modular monolith from a plain monolith?",
+      options: [
+        "It is deployed as several containers that share one database",
+        "Code is organised by domain with explicit interfaces, and modules do not reach into each other's tables",
+        "Each module has its own database server",
+        "It uses a message broker between modules instead of function calls",
+      ],
+      answer: "B",
+      why: "A modular monolith is still one deployable unit with in-process calls. The difference is enforced boundaries, which keeps it easy to change and possible to split later. Separate databases and brokers are steps toward microservices.",
+    },
+    {
+      q: "Why does v1's inline webhook processing eventually become a problem?",
+      options: [
+        "Express cannot handle more than one webhook at a time",
+        "WhatsApp does not allow API calls to other services during a webhook",
+        "Slow processing delays the 200 response, so the sender retries and duplicate messages and timeouts follow as volume grows",
+        "Inline processing uses more tokens per order",
+      ],
+      answer: "C",
+      why: "Node handles many concurrent requests, and nothing forbids outbound calls. The issue is that several seconds of work before acknowledging a webhook invites retries, duplicates and timeouts under load. Token usage is unaffected. Lesson 7 moves this work onto a queue.",
+    },
+  ]}
+/>

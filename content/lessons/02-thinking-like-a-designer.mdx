@@ -1,3 +1,247 @@
 ## The problem
 
-Coming soon.
+DukaanVoice has a working demo. Anjali, the CTO, recorded herself ordering "do kilo atta aur ek Surf Excel" in a noisy kitchen, and the demo turned it into a correct order. An investor watched it twice and then asked one question:
+
+"What does this cost you at 50,000 shops?"
+
+Anjali did not know. Neither did Farhan, the other engineer. They knew the demo cost about a rupee to run, but they had no idea whether that rupee would become ₹50 lakh or ₹5 crore a month at scale, whether one server would do or fifty, or whether the speech-to-text bill would be bigger than the LLM bill.
+
+This lesson is about answering that question in ten minutes on a whiteboard. It is the same skill interviewers test in the first quarter of every system design round, and it is the skill that stops you from building the wrong thing.
+
+## Two kinds of requirements
+
+Before any numbers, you need to know what you are building. Requirements come in two kinds.
+
+**Functional requirements** describe what the system does. They are the features a user could point at:
+
+- A customer can send a voice note or text in Telugu, Hindi, English or a mix, and receive an order summary.
+- A customer can confirm or change the order, and receive a UPI payment link.
+- A shopkeeper sees new orders on the app and dashboard, and can update stock and prices.
+- A shopkeeper can ask questions about sales and stock in plain language.
+
+**Non-functional requirements** (NFRs) describe how well it does it. They are the qualities nobody asks for until they are missing:
+
+- **Latency:** how long until the customer sees the order summary? Target: 95% of voice notes answered within 6 seconds (written "p95 under 6 s"; p95 means the 95th percentile, the value 95% of requests are faster than).
+- **Availability:** what fraction of time does it work? Target: 99.9%, which allows about 43 minutes of downtime a month.
+- **Correctness:** what must never be wrong? No double charges, no overselling stock, no order going to the wrong shop.
+- **Scalability:** it must grow from 20 shops to 50,000 without a rewrite, and survive a 10x Diwali spike.
+- **Cost:** AI spend must stay under about 25 paise per order.
+- **Privacy and compliance:** voice notes and phone numbers are personal data under India's DPDP Act.
+- **Resilience:** small-town networks drop; the shopkeeper app must keep working offline.
+
+Notice that the functional list could describe a weekend hackathon project. The non-functional list is what turns it into a system design problem. In interviews, candidates who skip NFRs end up designing something that works for one user and cannot answer "what happens on Diwali?".
+
+<Callout title="A useful habit">
+
+When you write an NFR, attach a number to it. "Fast" is not a requirement. "p95 under 6 seconds from voice note received to summary sent" is one you can design for, measure and argue about.
+
+</Callout>
+
+## Back-of-envelope estimation
+
+Back-of-envelope estimation means working out rough numbers fast, with round figures, to find out which parts of the design actually matter. You are not trying to be precise. You are trying to be within a factor of two or three, so you can tell whether something needs one server or a thousand.
+
+Two numbers make the arithmetic easy:
+
+- A day has 86,400 seconds. Round it to **100,000** when you are in a hurry; you will be about 15% low, which is fine.
+- A month is about 30 days. A year is about 365.
+
+The chain always runs the same way: **users → actions per day → requests per second → storage → bandwidth**. For DukaanVoice the "users" are shops, because shops are what we sell to.
+
+<Diagram
+  fig="2.1"
+  caption="The estimation chain. Every number below the first comes from the one above it."
+  label="Estimation chain: 50,000 shops times 40 orders gives 2 million orders a day; times 4 messages gives 8 million messages a day, about 93 per second average, 280 at evening peak and about 1,000 on Diwali. Orders also lead to storage of about 6 GB a day of rows plus 48 GB of audio, and to about 5.6 billion LLM tokens a day."
+  chart={`flowchart TD
+  A["50,000 shops"] -->|"× 40 orders/day"| B["2M orders/day"]
+  B -->|"× 4 messages"| C["8M messages/day"]
+  C -->|"÷ 86,400 s"| D["~93 msg/s average"]
+  D -->|"× 3 evening"| E["~280 msg/s peak"]
+  D -->|"× 10 Diwali"| F["~1,000 msg/s spike"]
+  B --> G["Storage: ~6 GB/day rows"]
+  B -->|"× 1.5 voice notes"| H["Audio: ~48 GB/day"]
+  B -->|"× 2,800 tokens"| I["~5.6B tokens/day"]
+`}
+/>
+
+### Step 1: traffic
+
+Start from what you know about the business. A typical kirana store using DukaanVoice takes about **40 orders a day** through it. At the year-two target of **50,000 shops**:
+
+- Orders: 50,000 × 40 = **2,000,000 orders a day**.
+- Each order involves about **4 inbound customer messages**: the order itself, a clarification or change, the confirmation, and a "paid" or "when will it come?" message. That is **8,000,000 messages a day**.
+- Average rate: 8,000,000 ÷ 86,400 ≈ **93 messages per second**.
+
+Averages lie, though. Kirana orders cluster in the evening between 6 and 9 pm, when people get home and check what is missing. A **peak factor** captures this. If 30% of the day's messages land in those 3 hours, the evening rate is about 3x the average: roughly **280 messages per second**. On Diwali evening, when everyone orders sweets, dry fruits, diyas and gifts at once, plan for **10x the average**: about **930, call it 1,000 messages per second**.
+
+You will design for that 1,000, not the 93. Lesson 18 is entirely about that night.
+
+### Step 2: storage
+
+Next, how much data piles up?
+
+- **Order rows.** An order with its line items, status history and payment reference is about 1 KB. 2,000,000 × 1 KB = **2 GB a day**, about 730 GB a year.
+- **Message rows.** Each message's text, metadata and transcript is about 0.5 KB. 8,000,000 × 0.5 KB = **4 GB a day**, about 1.5 TB a year.
+- **Voice notes.** About 1.5 voice notes per order (some orders are text). WhatsApp voice notes use the Opus codec at roughly 16 kilobits per second, so an average 8-second note is about **16 KB**. 3,000,000 × 16 KB = **48 GB a day**, about 1.4 TB a month.
+
+What does this tell you? Rows grow at about 6 GB a day, which a single well-tuned Postgres database can hold for years. Audio is the bulk, and it belongs in object storage (like Amazon S3), not in the database. It also tells you that keeping every voice note forever means storing around 17 TB a year of people's voices, which matters for privacy and cost in lesson 16.
+
+### Step 3: bandwidth
+
+Inbound audio at 48 GB a day is 48,000 MB ÷ 86,400 s ≈ **0.56 MB/s** on average, about 4.5 megabits per second. Even at a 10x spike that is around 45 megabits per second. That is a modest number for any cloud provider.
+
+This is a real finding, not a dead end. Bandwidth is **not** where DukaanVoice will hurt. A good estimate tells you what to ignore as much as what to worry about.
+
+### Step 4: concurrency
+
+One more number interviewers love, because it connects traffic to servers. **Little's law** says that the average number of requests in flight equals the arrival rate times the average time each one takes:
+
+> in-flight = arrival rate × time per request
+
+If voice notes arrive at 1,000 per second during the Diwali spike and each takes about 4 seconds to transcribe and understand, then 1,000 × 4 = **4,000 voice notes are being processed at the same moment**. That number drives how many workers you need, how many concurrent connections you open to model providers, and whether you will hit their rate limits. Hold on to it for lessons 7, 10 and 18.
+
+## Token math: turning traffic into an AI bill
+
+Now the question the investor asked. LLM providers charge per **token**, a chunk of text roughly three-quarters of an English word. Hindi and Telugu written in their native scripts usually take more tokens per word than English, so measure with your provider's tokenizer rather than guessing. You pay separately for **input tokens** (everything you send: instructions, catalog snippets, conversation history) and **output tokens** (what the model writes), and output is usually several times more expensive per token.
+
+The formula is simple:
+
+> monthly AI bill = orders per month × tokens per order × price per token
+
+For DukaanVoice, a typical order runs through a few model calls (understand the message, match items, write the summary). Measured across a test set, the total is about **2,500 input tokens and 300 output tokens per order**. Most of the input is instructions and catalog matches, not the customer's words.
+
+Prices change constantly and differ by vendor, so this course uses illustrative numbers. Always check the current price page before doing this for real:
+
+| | Input, per 1M tokens | Output, per 1M tokens |
+| --- | --- | --- |
+| Small, fast model | $0.15 | $0.60 |
+| Large, smart model | $3.00 | $15.00 |
+
+Speech-to-text (STT) is priced per minute of audio. Use **$0.006 per minute** as an illustrative figure. For conversions, use **₹85 per US dollar**.
+
+Now compute one order:
+
+- **Small model:** 2,500 × $0.15/1M + 300 × $0.60/1M = $0.000375 + $0.00018 ≈ **$0.00056 ≈ ₹0.05**.
+- **Large model:** 2,500 × $3/1M + 300 × $15/1M = $0.0075 + $0.0045 = **$0.012 ≈ ₹1.02**.
+- **Speech-to-text:** 1.5 voice notes × 8 s = 12 s = 0.2 min × $0.006 = **$0.0012 ≈ ₹0.10**.
+
+Then scale to a month at year two, 60,000,000 orders:
+
+| Setup | Per order | Per month |
+| --- | --- | --- |
+| Small model + STT | about ₹0.15 | about ₹90 lakh |
+| Large model + STT | about ₹1.12 | about ₹6.7 crore |
+
+And revenue? 50,000 shops × ₹1,499 = **₹7.5 crore a month**, which is about **₹1.25 per order**.
+
+Read that table again. If every order goes to the large model, AI alone eats about 90% of revenue, before servers, WhatsApp messaging fees, payment fees, salaries or support. With the small model, AI is about 12% of revenue. The design question is not "which model is best?" It is "how do we send the 90% of easy orders to the cheap path and only the hard ones to the expensive path, without hurting accuracy?". That is lessons 10 and 17.
+
+Also notice something most people miss: with the small model, **speech-to-text costs twice as much as the LLM**. If you had only optimised prompts, you would have optimised the smaller half of the bill.
+
+Here is the whole calculation as code. You would keep something like this next to your pricing config, so every model change comes with a cost estimate:
+
+```ts title="lib/cost-estimate.ts"
+type Price = { inPerM: number; outPerM: number }; // USD per 1M tokens
+
+const USD_TO_INR = 85; // illustrative
+const STT_PER_MIN = 0.006; // illustrative, check your vendor
+
+export function costPerOrderInr(p: Price, opts = { inTok: 2500, outTok: 300, audioSec: 12 }) {
+  const llm = (opts.inTok * p.inPerM + opts.outTok * p.outPerM) / 1_000_000;
+  const stt = (opts.audioSec / 60) * STT_PER_MIN;
+  return (llm + stt) * USD_TO_INR;
+}
+
+export function monthlyBillInr(p: Price, shops: number, ordersPerShopPerDay = 40) {
+  const orders = shops * ordersPerShopPerDay * 30;
+  return orders * costPerOrderInr(p);
+}
+
+// monthlyBillInr({ inPerM: 0.15, outPerM: 0.6 }, 50_000) ≈ ₹90 lakh
+// monthlyBillInr({ inPerM: 3, outPerM: 15 }, 50_000)    ≈ ₹6.7 crore
+```
+
+### Rate limits fall out of the same numbers
+
+Token math also tells you whether a provider will even accept your traffic. Providers cap **tokens per minute** (TPM) and **requests per minute** (RPM) per account. At the Diwali peak, orders arrive at about 10x the average of 23 per second, so around 230 orders per second. At roughly 2,800 tokens each, that is about 650,000 tokens per second, or around **39 million tokens per minute**. Whether your account allows that is a conversation with your provider weeks before Diwali, not on the night. Lesson 10 shows how a gateway spreads that load across providers.
+
+## Turning numbers into design decisions
+
+Estimation is only useful if it changes what you build. From this lesson's numbers alone, you can already say:
+
+- **The database is not the first bottleneck.** 6 GB a day of rows and a few hundred writes per second fit a single primary Postgres for a long time.
+- **Audio goes to object storage**, with only a reference in the database.
+- **The AI path needs a queue**, because 4,000 concurrent slow jobs cannot each hold an open web request.
+- **Cost is a first-class requirement.** Model choice, caching and routing are budget decisions, not just quality decisions.
+- **Peaks matter more than averages.** Design for about 1,000 messages per second and 39 million tokens per minute on Diwali.
+
+<Decision id="peak-vs-average" />
+
+<Decision id="correctness-vs-latency" />
+
+## Interview angle
+
+<Interview
+  ask="Before we design anything, how big is this system?"
+  mistake="Spending ten minutes on precise arithmetic, or skipping estimation and jumping to boxes. Use round numbers, say your assumptions out loud, and finish with what the numbers mean for the design."
+>
+
+- You state assumptions clearly ("let's assume 50,000 shops, 40 orders each per day") and invite correction.
+- You convert to per-second rates, then apply a peak factor, and say which number you are designing for.
+- You estimate storage and separate small structured data from large blobs.
+- For AI products, you do token math and compare cost per unit to revenue per unit. Very few candidates do this, and it immediately signals production experience.
+- You close with conclusions: "so storage is not the issue, cost and latency of the AI path are".
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Functional requirements say what the system does; non-functional requirements (latency, availability, correctness, cost, privacy) decide how you build it. Put a number on each.
+- The estimation chain is users → actions per day → requests per second → peak → storage → bandwidth. Round aggressively and keep going.
+- Little's law (in-flight = rate × duration) turns traffic into concurrency, which turns into workers, connections and rate limits.
+- Token math (orders × tokens × price) is the AI version of capacity planning. Compare it to revenue per order, not to your intuition.
+- The point of estimating is a conclusion: what you can ignore, and what will hurt first.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "DukaanVoice averages 93 messages per second across the day. Which number should the interactive order path be designed to handle?",
+      options: [
+        "93 messages per second, because that is the measured average",
+        "186 messages per second, a standard 2x safety margin on the average",
+        "About 1,000 messages per second, the Diwali peak, with spare headroom",
+        "8 million messages, since that is the daily total",
+      ],
+      answer: "C",
+      why: "A customer waiting on a reply cannot be queued for an hour, so the interactive path needs peak capacity. A flat 2x margin sounds prudent but ignores that evening peaks are 3x and Diwali is 10x. The daily total is not a rate at all.",
+    },
+    {
+      q: "With the small model, which part of the per-order AI cost is larger?",
+      options: [
+        "Speech-to-text, at about ₹0.10 per order versus about ₹0.05 for the LLM",
+        "The LLM, because language models are always the most expensive component",
+        "They are exactly equal",
+        "Output tokens, because they are priced higher than input tokens",
+      ],
+      answer: "A",
+      why: "1.5 voice notes of 8 seconds is 12 seconds of audio, about ₹0.10 at the illustrative price, while 2,500 input and 300 output tokens on the small model is about ₹0.05. Output tokens are pricier per token, but there are far fewer of them.",
+    },
+    {
+      q: "Voice notes arrive at 1,000 per second and each takes about 4 seconds to process. Roughly how many are being processed at once?",
+      options: [
+        "250, because 1,000 divided by 4 is 250",
+        "1,000, the same as the arrival rate",
+        "It cannot be estimated without load testing",
+        "About 4,000, from Little's law: arrival rate times time per request",
+      ],
+      answer: "D",
+      why: "Little's law gives in-flight = rate × duration = 1,000 × 4 = 4,000. Dividing instead of multiplying is a common slip. Load testing confirms the number later, but you can and should estimate it first.",
+    },
+  ]}
+/>

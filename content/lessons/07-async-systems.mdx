@@ -1,3 +1,283 @@
 ## The problem
 
-Coming soon.
+DukaanVoice now serves 2,000 shops across Telangana and Andhra Pradesh, about 60,000 orders a day. On a Sunday evening the speech-to-text provider has a bad hour: transcriptions that normally take 1 second take 8 to 12.
+
+Because v1 processes each voice note **inside** the WhatsApp webhook request (you saw the comment in lesson 3), every webhook now takes over 12 seconds to answer. Meta's servers treat slow or failed deliveries as failures and **retry** them. The retries create duplicate jobs, which make everything slower, which causes more retries. Within twenty minutes:
+
+- 340 customers receive the same order summary two or three times, and 41 orders are created twice.
+- The API's database connection pool is exhausted by requests waiting on transcription, so the shopkeeper **dashboard** stops loading too, even though it has nothing to do with voice.
+- In the middle of the chaos, Farhan notices a request in the logs to the payment webhook claiming an order was paid. The payment gateway has no record of it. Someone found the URL and tried their luck.
+
+One slow dependency took down the whole product. This lesson rebuilds the message path so that cannot happen again.
+
+## Synchronous vs asynchronous work
+
+When you call an API and wait for the answer, the work is **synchronous**: the caller is blocked until it finishes. When you hand the work off, get an immediate "accepted", and let something else finish it later, it is **asynchronous**.
+
+The test for which you need is simple. Ask: **does the caller need the result in this response?**
+
+Meta's webhook does not. It only needs to know you received the message. The customer will get the reply as a separate WhatsApp message whenever it is ready. So the webhook should do the minimum (verify it, record it, enqueue a job) and answer in milliseconds. The slow, failure-prone work (download audio, transcribe, understand, match, reply) moves to a **worker**.
+
+## Queues and workers
+
+A **message queue** sits between the code that creates work (the **producer**) and the code that does it (the **consumer** or **worker**). The producer adds a job; the queue stores it durably; a worker takes it, processes it and acknowledges it. If the worker crashes before acknowledging, the job becomes available again.
+
+That one change gives you three properties the v1 design lacked:
+
+- **Isolation.** A slow speech-to-text provider fills the queue, not your web server's connection pool. The dashboard keeps working.
+- **Load levelling.** A burst of 1,000 voice notes becomes a queue that workers drain at the rate they can sustain. Lesson 18 leans on this hard.
+- **Retries in one place.** Failed jobs are retried by the queue with a policy you define, instead of by whoever happened to be calling.
+
+<Diagram
+  fig="7.1"
+  caption="The async message path. The webhook only verifies, records and enqueues. Workers do the slow work and can fail without affecting anything else."
+  label="Async pipeline: WhatsApp posts a webhook to the ingest endpoint, which verifies the signature, records the message ID, enqueues a job and returns 200 in milliseconds. Voice workers take jobs from the queue, download audio, transcribe, understand and reply. Failed jobs are retried with backoff; jobs that fail repeatedly go to a dead-letter queue that alerts the on-call engineer."
+  chart={`flowchart TD
+  WA["WhatsApp Cloud API"] -->|"POST webhook"| IN["Ingest endpoint"]
+  IN -->|"1. verify signature"| IN
+  IN -->|"2. insert message id (unique)"| DB[("Postgres")]
+  IN -->|"3. enqueue job"| Q[("Voice queue")]
+  IN -->|"4. 200 OK in ~50 ms"| WA
+  Q --> W1["Voice worker"]
+  Q --> W2["Voice worker"]
+  W1 -->|"transcribe, understand, reply"| EXT["STT, LLM, WhatsApp send"]
+  W1 -.->|"failed: retry with backoff"| Q
+  W2 -.->|"failed 6 times"| DLQ[("Dead-letter queue")]
+  DLQ --> AL["Alert on-call"]
+`}
+/>
+
+The workers run from the **same codebase** as the API, started as a separate process (`node dist/worker.js`). This is still the modular monolith from lesson 3; it just has two entry points now, which you can scale independently. At peak you might run 4 API instances and 20 workers.
+
+### Choosing a queue
+
+In the Node.js world the two common choices are **BullMQ**, a library that builds queues on top of Redis, and a **managed cloud queue** like Amazon SQS (Simple Queue Service) or Google Pub/Sub. RabbitMQ and Kafka are also common, but Kafka is a distributed log designed for very high-throughput event streaming and replay. It is a lot of machinery for a job queue, and you would add it for different reasons.
+
+```ts title="modules/messaging/ingest.ts"
+import { Queue } from "bullmq";
+
+export const voiceQueue = new Queue("voice", { connection: redis });
+
+export async function enqueueVoiceNote(msg: { id: string; shopId: string; mediaId: string }) {
+  await voiceQueue.add("process", msg, {
+    jobId: msg.id,                 // WhatsApp's message id: adding the same job twice is a no-op
+    attempts: 6,
+    backoff: { type: "exponential", delay: 2_000 },
+    removeOnComplete: { age: 24 * 3600 },
+    removeOnFail: false,           // keep failures for inspection
+  });
+}
+```
+
+<Decision id="queue-choice" />
+
+## Retries, backoff and jitter
+
+Failures come in two kinds, and your retry policy must tell them apart:
+
+- **Transient** failures might succeed if you try again: timeouts, `503 Service Unavailable`, `429 Too Many Requests`, a dropped connection.
+- **Permanent** failures will fail every time: a `400` because the audio format is unsupported, a deleted media ID, a bug in your code. Retrying these wastes money and delays the alert.
+
+For transient failures, retry with **exponential backoff**: wait 1 s, then 2 s, then 4 s, then 8 s. Doubling gives a struggling dependency room to recover instead of hammering it. But if 4,000 jobs all failed at the same moment, they will all retry at exactly 1 s, 2 s and 4 s later, in synchronised waves. Adding **jitter** (randomness) spreads them out. The "full jitter" variant picks a random delay between zero and the exponential cap, and in practice it smooths load very well.
+
+```ts title="shared/retry.ts"
+export async function withRetry<T>(fn: () => Promise<T>, opts = { attempts: 5, baseMs: 500, capMs: 20_000 }): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isTransient(err) || attempt + 1 >= opts.attempts) throw err;
+      const ceiling = Math.min(opts.capMs, opts.baseMs * 2 ** attempt);
+      await sleep(Math.random() * ceiling); // full jitter
+    }
+  }
+}
+
+function isTransient(err: any) {
+  const s = err?.status;
+  return s === 429 || s === 503 || s === 502 || s === 504 || err?.code === "ETIMEDOUT" || err?.code === "ECONNRESET";
+}
+```
+
+If a dependency tells you when to come back (a `Retry-After` header on a `429`), respect it instead of guessing. And always cap the total number of attempts: unbounded retries turn an outage into a self-inflicted denial of service.
+
+## Dead-letter queues
+
+What happens to a job that fails six times? It must not vanish, and it must not retry forever. It goes to a **dead-letter queue** (DLQ): a holding area for jobs that could not be processed. A DLQ does three things for you:
+
+- **Nothing is lost.** The customer's voice note is still there to be processed once you fix the cause.
+- **Poison messages stop hurting.** A malformed job that crashes the worker every time is parked instead of blocking or crashing the fleet.
+- **It is a signal.** A growing DLQ is one of the best alerts you can have. Alert on its size, and build a small tool to inspect jobs and replay them after a fix.
+
+For DukaanVoice, a dead-lettered voice note also triggers a polite fallback message to the customer ("Sorry, we couldn't process your voice note. Could you type your order?") and a notification to the shopkeeper. A human fallback beats silence.
+
+## Delivery guarantees: why "exactly once" is a trap
+
+Queues offer one of three delivery guarantees:
+
+- **At-most-once.** Each message is delivered zero or one times. Fast, but messages can be lost.
+- **At-least-once.** Each message is delivered one or more times. Nothing is lost, but duplicates happen, for example when a worker finishes the job but crashes before acknowledging it.
+- **Exactly-once.** Each message is processed exactly one time. Across real networks and independent systems this is not achievable in general, because a crash between "did the work" and "recorded that I did the work" is always possible.
+
+Most real systems, including BullMQ, SQS standard queues and webhooks from WhatsApp and payment gateways, give you **at-least-once**. The practical answer is **at-least-once delivery plus idempotent consumers**, which together behave like exactly-once processing. You make the consumer safe to run twice.
+
+### Idempotent consumers
+
+The cheapest way is the same trick as idempotency keys in lesson 5: record a unique ID for every message you have processed, enforced by a database constraint, in the same transaction as the work.
+
+```ts title="workers/voice.ts"
+export async function processVoiceJob(job: { id: string; shopId: string; mediaId: string }) {
+  const transcript = await transcribe(job);   // safe to repeat: no side effects
+  const draft = await understand(transcript); // safe to repeat (it costs tokens, but has no side effects)
+
+  await db.tx(async (tx) => {
+    // The unique constraint on message_id makes the whole block run once per message
+    const { rowCount } = await tx.query(
+      `INSERT INTO processed_messages (message_id, shop_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [job.id, job.shopId]);
+    if (rowCount === 0) return; // duplicate delivery: already handled
+
+    const order = await createDraftOrder(tx, job.shopId, draft);
+    await enqueueOutbox(tx, "order.drafted", { orderId: order.id }); // see the outbox below
+  });
+}
+```
+
+Notice where the side effects are. Transcription and understanding are repeated on a duplicate, which costs a few paise but harms nobody. Creating the order and sending the reply happen only once, guarded by the unique insert. When you design a consumer, sort its steps into "safe to repeat" and "must happen once", and guard the second group.
+
+### Ordering
+
+At-least-once queues with many workers also do not guarantee **order**. A customer who sends "2 kilo atta" and then, five seconds later, "sorry, make it 3" might have the second message processed first. For DukaanVoice, messages from the same customer to the same shop are processed one at a time by holding a short lock per conversation (a Redis lock or a Postgres advisory lock on the conversation ID), while different conversations run in parallel. You rarely need global ordering; you usually need ordering per entity.
+
+## The outbox pattern
+
+After the worker creates the order, two more things must happen: the customer gets the summary on WhatsApp, and the shopkeeper's phone gets a notification. The obvious code is:
+
+```ts
+await db.insertOrder(order);          // 1. commit to the database
+await queue.add("notify", { order }); // 2. publish an event
+```
+
+This is the **dual-write problem**. If the process crashes between line 1 and line 2, the order exists but nobody is ever told. If you swap the lines and the database insert fails, you have notified people about an order that does not exist. You cannot make a database and a queue commit atomically together.
+
+The **transactional outbox** solves it. Instead of publishing directly, you insert the event into an `outbox` table **in the same database transaction** as the order. Either both commit or neither does. A separate **relay** process reads unpublished outbox rows, publishes them to the queue, and marks them as sent.
+
+<Diagram
+  fig="7.2"
+  caption="The outbox pattern. The order and its event commit together; the relay publishes later and may publish twice, so consumers are idempotent."
+  label="Outbox pattern: the worker writes the order row and an outbox event row in one Postgres transaction. A relay process polls the outbox table for unsent rows, publishes each event to the notification queue, and marks the row sent. Consumers send the WhatsApp reply and the push notification, deduplicating by event ID."
+  chart={`flowchart TD
+  W["Voice worker"] -->|"one transaction"| TX
+  subgraph TX["Postgres transaction"]
+    O[("orders: new row")]
+    OB[("outbox: order.drafted")]
+  end
+  R["Outbox relay"] -->|"poll unsent rows"| OB
+  R -->|"publish"| NQ[("Notification queue")]
+  R -->|"mark sent"| OB
+  NQ --> C1["Send WhatsApp summary"]
+  NQ --> C2["Push to shopkeeper app"]
+`}
+/>
+
+The relay can crash after publishing but before marking the row sent, so it may publish an event twice. That is fine: it is at-least-once again, and the consumers are idempotent, keyed on the event ID. The relay itself is about 30 lines: select a batch of unsent rows with `FOR UPDATE SKIP LOCKED` (so several relays never grab the same row), publish, update. Postgres's change data capture tools (for example Debezium reading the write-ahead log) can replace polling when volume grows.
+
+<Decision id="outbox-vs-direct" />
+
+## Trusting incoming webhooks
+
+Back to the fake payment. A webhook endpoint is a public URL. Anyone who finds it can post to it. Every webhook must be **authenticated**, and both of DukaanVoice's providers support the same mechanism: an **HMAC signature**. HMAC (hash-based message authentication code) combines the request body with a shared secret to produce a signature that only someone holding the secret could compute. Meta sends it in the `X-Hub-Signature-256` header, computed with SHA-256 over the raw body using your app secret. Payment gateways do the same with their own header and secret.
+
+```ts title="modules/messaging/verify.ts"
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+// Must run on the RAW body bytes: re-serialised JSON will not match the signature.
+export function verifyMetaSignature(rawBody: Buffer, header: string | undefined) {
+  if (!header?.startsWith("sha256=")) return false;
+  const expected = createHmac("sha256", process.env.WA_APP_SECRET!).update(rawBody).digest();
+  const given = Buffer.from(header.slice(7), "hex");
+  return given.length === expected.length && timingSafeEqual(given, expected); // constant-time compare
+}
+
+// app.post("/webhooks/whatsapp", express.raw({ type: "application/json" }), handler)
+```
+
+Four rules for every incoming webhook:
+
+1. **Verify the signature** on the raw body with a constant-time comparison, and reject failures with `401`.
+2. **Deduplicate** by the provider's event or message ID with a unique constraint. Webhooks are at-least-once too.
+3. **Acknowledge fast** and process asynchronously.
+4. **Do not trust the payload for money.** When a payment webhook says "paid", confirm the amount and status by calling the gateway's API (or at least check the amount against your order) before you mark the order paid. Treat the webhook as a hint that something changed, then fetch the truth.
+
+## What the architecture looks like now
+
+The message path is now asynchronous end to end. The ingest endpoint verifies signatures, records message IDs and enqueues jobs in about 50 ms. Voice workers, scaled separately, transcribe and understand with retries, backoff and jitter. Orders and their events commit together through an outbox, and a relay publishes notifications. Failures land in a dead-letter queue that pages someone. Webhooks are verified and deduplicated.
+
+When the speech-to-text provider has its next bad hour, the voice queue grows, replies slow down, and the dashboard does not notice. Lesson 9 will make that slow hour even less visible, with fallbacks inside the voice pipeline itself.
+
+## Interview angle
+
+<Interview
+  ask="How do you guarantee each incoming message is processed exactly once?"
+  mistake="Claiming the queue gives you exactly-once delivery. Interviewers want to hear that you assume at-least-once and make consumers idempotent."
+>
+
+- You explain why exactly-once delivery is not generally achievable across systems, and that at-least-once plus idempotency gives effectively-once processing.
+- You describe the dedupe mechanism concretely: a unique message ID recorded in the same transaction as the side effect.
+- You know retries need backoff with jitter and a cap, and that permanent errors should not be retried.
+- You can explain the dual-write problem and the outbox pattern, and why the relay's duplicates are harmless.
+- For webhooks: verify signatures on the raw body, deduplicate, acknowledge fast, re-check money with the source.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- If the caller does not need the result now, acknowledge fast and do the work on a queue. It isolates slow dependencies and levels load.
+- Retry transient errors with exponential backoff, full jitter and a cap; never retry permanent errors; send repeated failures to a dead-letter queue and alert on it.
+- Assume at-least-once delivery everywhere and make consumers idempotent with a unique ID enforced in the same transaction as the side effect.
+- Use a transactional outbox whenever an event must be published if and only if a database change commits.
+- Verify webhook signatures on the raw body, deduplicate by event ID, and confirm payments with the gateway before trusting them.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "A worker creates the order, sends the WhatsApp reply, then crashes before acknowledging the job. The queue redelivers it. What prevents a second order and a second reply?",
+      options: [
+        "Configuring the queue for exactly-once delivery",
+        "Retrying with exponential backoff so the second attempt comes much later",
+        "Moving the job to the dead-letter queue after the first attempt",
+        "Recording the message ID with a unique constraint in the same transaction as the order, and skipping the work if it already exists",
+      ],
+      answer: "D",
+      why: "Redelivery after a crash is normal at-least-once behaviour, and no queue setting can rule it out across systems. Backoff only delays the duplicate. Dead-lettering a job that succeeded is wrong. An idempotent consumer makes the duplicate harmless.",
+    },
+    {
+      q: "Why add jitter to exponential backoff?",
+      options: [
+        "It makes each retry more likely to succeed on its own",
+        "It reduces the total number of retries needed",
+        "It spreads out retries from many clients that failed at the same moment, so they do not hit the recovering service in synchronised waves",
+        "It is required by the HTTP specification for 429 responses",
+      ],
+      answer: "C",
+      why: "Without jitter, thousands of jobs that failed together retry together at 1 s, 2 s, 4 s and so on, which can knock over a service that is just recovering. Jitter does not change any single attempt's odds or the attempt count, and HTTP does not mandate it.",
+    },
+    {
+      q: "What problem does the transactional outbox pattern solve?",
+      options: [
+        "Messages arriving out of order from the same customer",
+        "A crash between committing a database change and publishing the matching event, leaving the two out of sync",
+        "Webhooks being sent by attackers who found the URL",
+        "Workers processing the same job twice",
+      ],
+      answer: "B",
+      why: "The outbox writes the event in the same transaction as the data, so they commit together, and a relay publishes it later. Ordering needs per-conversation locks, forged webhooks need signature checks, and duplicate processing needs idempotent consumers, which the outbox actually relies on.",
+    },
+  ]}
+/>

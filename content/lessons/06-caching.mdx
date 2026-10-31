@@ -1,3 +1,186 @@
 ## The problem
 
-Coming soon.
+Five hundred shops, and the evenings are getting slow. Between 7 and 9 pm the Postgres CPU sits at 85%, the dashboard takes four seconds to load, and voice-note replies have crept from 4 seconds to 7.
+
+Farhan looks at the slow query log and finds the culprits are not the writes at all. They are reads, the same ones over and over:
+
+- Every voice note loads the shop's **entire catalog** (about 2,000 products) so the LLM can match items. Ravi's shop gets 60 voice notes an hour; that is 60 identical catalog loads.
+- Every dashboard tab **polls** "today's summary" (orders, revenue, top items) every 10 seconds. Five hundred shopkeepers, some with two tabs open, recompute the same aggregates thousands of times an hour.
+- The shop settings (name, hours, delivery radius, language) are read on every single request.
+
+The data barely changes. The database is doing the same work again and again. That is exactly what a cache is for.
+
+## What a cache is, and where caches live
+
+A **cache** is a fast store holding copies of data that is expensive to fetch or compute, so you can skip the expensive step next time. Every cache trades **freshness** for **speed**: the copy might be out of date.
+
+There are caches at every layer of DukaanVoice, and you already use most of them without thinking:
+
+- **Browser cache.** The dashboard's JavaScript and fonts are downloaded once and reused, controlled by `Cache-Control` headers.
+- **CDN** (content delivery network). Servers spread across many cities that keep copies of static files and product images close to users. A shopkeeper in Guntur loads images from a nearby edge server instead of your origin.
+- **In-process memory.** A `Map` inside your Node process. Fastest possible, but each instance has its own copy, they disagree with each other, and it disappears on deploy.
+- **A shared cache** like **Redis**: an in-memory key-value store that all API instances talk to over the network. Sub-millisecond reads, one shared copy.
+- **The database's own buffer cache.** Postgres keeps hot pages in memory. Often the cheapest "cache" is enough RAM for your working set.
+
+For the catalog and dashboard problems, Redis is the right tool.
+
+## Cache-aside: the default pattern
+
+The most common pattern is **cache-aside** (also called lazy loading). The application checks the cache first; on a **miss**, it reads from the database and stores the result in the cache with an expiry time.
+
+<Diagram
+  fig="6.1"
+  caption="The read path after this lesson. The cache absorbs repeated reads; replicas take heavy queries off the primary."
+  label="Read path: the API checks Redis first. On a hit it returns immediately. On a miss it reads from Postgres and fills Redis with a TTL. Writes go to the Postgres primary and delete the related cache key. Heavy dashboard and analytics queries go to a read replica that receives changes from the primary asynchronously. Static assets and images are served from a CDN."
+  chart={`flowchart TD
+  U["Shopkeeper dashboard"] -->|"images, JS"| CDN["CDN edge"]
+  U --> API["API"]
+  W["Voice-note worker"] --> API
+  API -->|"1. get key"| R[("Redis")]
+  R -.->|"hit"| API
+  API -->|"2. on miss, read"| P[("Postgres primary")]
+  API -->|"3. set key with TTL"| R
+  API -->|"writes, then delete key"| P
+  API -->|"heavy reads"| RR[("Read replica")]
+  P -.->|"async replication"| RR
+`}
+/>
+
+```ts title="modules/catalog/cache.ts"
+const TTL_SECONDS = 300;
+
+export async function getCatalog(shopId: string): Promise<Product[]> {
+  const key = `shop:${shopId}:catalog:v3`; // tenant id and schema version in every key
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const products = await db.products.listActive(shopId);
+  const ttl = TTL_SECONDS + Math.floor(Math.random() * 60); // jitter, so keys don't all expire together
+  await redis.set(key, JSON.stringify(products), "EX", ttl);
+  return products;
+}
+
+export async function updateProduct(shopId: string, id: string, patch: ProductPatch) {
+  await db.products.update(shopId, id, patch);
+  await redis.del(`shop:${shopId}:catalog:v3`); // invalidate after the write commits
+}
+```
+
+Three small details in that code carry most of the wisdom:
+
+- **The key contains `shopId`.** A cache key without the tenant ID is a data leak waiting to happen: one shop's catalog served to another. Lesson 16 comes back to this for AI caches.
+- **The key contains a version** (`v3`). When the cached shape changes in a deploy, bump the version and old entries are simply ignored until they expire.
+- **The TTL has jitter.** If 10,000 keys were all set at 7:00 pm with the same TTL, they would all expire at 7:05 and hit the database at once.
+
+## TTLs and invalidation
+
+There is an old joke that there are only two hard things in computer science: cache invalidation and naming things. **Invalidation** means removing or updating cached data when the source changes. There are two tools, and you want both:
+
+- **TTL (time to live).** Every entry expires after a fixed time. Simple and self-healing: even if every other mechanism fails, staleness is bounded by the TTL. Choose it by asking "how stale can this be before someone is hurt?". Shop settings: an hour. Catalog: five minutes. Dashboard summary: 30 seconds.
+- **Explicit invalidation.** When you write, delete the related keys. Delete after the database commit, never before; otherwise a concurrent reader can refill the cache with the old value between your delete and your commit. Deleting is safer than updating the cache in place, because two concurrent updates can land in the cache in the wrong order, while a delete just forces the next reader to fetch the truth.
+
+Even with both, a small window of staleness remains. That is fine for a catalog shown to an LLM, because, as you will see, the final price and stock check happens against the database.
+
+### The stampede
+
+One more failure mode. A popular key expires and 200 concurrent requests all miss at once, all run the same expensive query, and all write the same value back. This is a **cache stampede** (or thundering herd). Fixes, in order of effort: jittered TTLs; **request coalescing**, where only one request recomputes while the others wait for its result; and refreshing hot keys in the background slightly before they expire.
+
+<Decision id="cache-pattern" />
+
+## Read replicas and replication lag
+
+The dashboard's heavy aggregates ("revenue by day for 30 days", "top 10 items") are a different problem. They are not repeated identically enough to cache well, and they are expensive. They are also read-only.
+
+A **read replica** is a copy of the database that continuously receives changes from the **primary** (the one that accepts writes) and serves read-only queries. Postgres does this with streaming replication, and every managed Postgres service offers it in a few clicks. Point the dashboard and reporting queries at the replica, and the primary is left to handle orders and stock.
+
+The catch is that replication is usually **asynchronous**: the primary commits, answers the client, and ships the change to replicas a moment later. The gap is called **replication lag**. It is typically milliseconds, but under heavy write load or a long-running query on the replica it can grow to seconds or minutes.
+
+That creates a classic bug. Ravi updates the price of atta and the app immediately reloads the product list from the replica, which has not received the change yet. He sees the old price and thinks the update failed. This violates **read-your-writes consistency**: a user should always see their own changes. Common fixes:
+
+- Read from the primary for a short time after a user writes (for example, route that user to the primary for 5 seconds).
+- Return the updated object in the write response, so the client does not need to re-read it.
+- Track the replication position and only use a replica that has caught up past the user's last write. More precise, more work.
+
+<Decision id="replica-reads" />
+
+## What not to cache
+
+Caching is so effective that teams start caching everything. Some things should never come from a cache:
+
+- **Anything that authorises money or stock movement.** The cached catalog is fine for helping the LLM guess what "atta" means. The stock check and price at confirmation must come from the primary database inside the transaction from lesson 4.
+- **Payment status.** "Has this order been paid?" must be the truth, not a five-minute-old copy.
+- **Permissions and sessions,** unless invalidation on revocation is airtight. A cached "is admin" check that survives a revocation is a security bug.
+- **Personal data in shared keys.** If a cache key does not include the tenant and, where relevant, the user, assume it will leak eventually.
+- **Errors, by accident.** If a database timeout returns an empty list and you cache it for five minutes, you have turned a two-second blip into a five-minute outage. Cache only successful results, or cache "not found" deliberately with a short TTL.
+
+A useful rule: caches make **reads** faster, never **decisions** correct. Anything whose staleness changes an outcome reads from the source of truth.
+
+## What the architecture looks like now
+
+Redis joins the system, holding catalogs, shop settings and dashboard summaries with tenant-scoped keys, jittered TTLs and delete-on-write. A read replica serves the dashboard's heavy queries. A CDN serves static assets and product images. Postgres CPU at peak drops from 85% to about 30%, and voice-note replies are back to 4 seconds. Redis will earn its keep again soon: lesson 7 uses it for the job queue, and lesson 10 for rate limits.
+
+## Interview angle
+
+<Interview
+  ask="Your database is overloaded by reads. What do you do?"
+  mistake="Jumping straight to “add Redis” without asking which reads, how fresh they must be, and how you will invalidate. Or proposing a cache for data that drives money decisions."
+>
+
+- You first measure: which queries, how often, how repetitive. Sometimes an index or more database RAM is the answer.
+- You pick a pattern (usually cache-aside), a TTL justified by tolerable staleness, and an invalidation strategy.
+- You mention stampedes and key design (tenant in the key, versioning).
+- You bring in read replicas for heavy queries and explain replication lag and read-your-writes.
+- You say clearly what you will not cache and why.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Caches trade freshness for speed. Decide how stale each piece of data may be, and set the TTL from that.
+- Cache-aside with a TTL plus delete-after-commit is the safe default. Put the tenant ID and a version in every key, and jitter TTLs.
+- Read replicas offload heavy reads, but asynchronous replication means lag; protect read-your-writes after a user's own changes.
+- Never let a cache decide anything involving money, stock, payment status or permissions.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Ravi changes a price, and the API invalidates the catalog cache. When should the cache delete happen?",
+      options: [
+        "Before the database write, so no reader can see the old cached value",
+        "After the database transaction commits, so a reader cannot refill the cache with the old value",
+        "It does not matter, as long as both happen in the same request",
+        "Never; rely on the TTL so the cache and database stay simple",
+      ],
+      answer: "B",
+      why: "Deleting before the commit leaves a window where a reader misses, reads the still-old row and caches it again. Deleting after commit means the next reader sees the new value. Relying only on the TTL works but leaves Ravi looking at his old price for minutes.",
+    },
+    {
+      q: "Ravi updates a price, the app reloads the product list from a read replica, and shows the old price. What is the cleanest fix?",
+      options: [
+        "Return the updated product in the write response, or read from the primary briefly after the user's own writes",
+        "Remove the read replica, since replicas cannot be trusted",
+        "Increase the cache TTL so the old price is shown consistently",
+        "Make replication synchronous for every write on the platform",
+      ],
+      answer: "A",
+      why: "This is a read-your-writes problem caused by replication lag. Targeted fixes keep the replica's benefits. Removing replicas or making all replication synchronous throws away capacity and write latency to fix one screen; a longer TTL makes it worse.",
+    },
+    {
+      q: "Which of these should DukaanVoice NOT serve from Redis?",
+      options: [
+        "The shop's catalog used to help the LLM interpret “atta”",
+        "The shop's opening hours and delivery radius",
+        "Today's sales summary on the dashboard",
+        "The stock count used to decide whether an order can be confirmed",
+      ],
+      answer: "D",
+      why: "Stock at confirmation decides whether money and goods move, so it must be read and changed atomically in the primary database. The other three tolerate some staleness, and the catalog is double-checked against the database at confirmation.",
+    },
+  ]}
+/>

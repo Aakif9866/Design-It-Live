@@ -1,3 +1,277 @@
 ## The problem
 
-Coming soon.
+Week two of the pilot, Saturday evening. Ravi has three 5 kg bags of Aashirvaad atta left. At 7:51 pm two customers, Lakshmi and Imran, both send voice notes asking for one bag each, and a third customer asks for two. DukaanVoice reads the stock (3), sees enough for each order individually, and confirms all three. Four bags sold, three on the shelf. Ravi spends twenty minutes on the phone apologising.
+
+The same week, Farhan suggests moving to MongoDB, because that is what he knows best and "orders are just documents anyway". And a pilot shop owner asks, half-joking, whether the shop next door can see his prices in the system.
+
+Three problems, one lesson: what database, what schema, how to keep stock correct when requests race each other, and how to keep 20 (and later 50,000) shops' data apart.
+
+## SQL or NoSQL: a real decision, not a religion
+
+You know MongoDB well, so start there. A document database stores self-contained JSON-like documents. It is excellent when each record is read and written as a whole, when the shape varies a lot between records, and when you rarely need to update several records atomically. MongoDB has supported multi-document transactions since version 4.0, so "Mongo cannot do transactions" is outdated. But transactions there are the exception you opt into, and relationships are something you maintain in application code.
+
+A relational database like **Postgres** stores rows in tables with a schema, enforces relationships with foreign keys, and makes multi-row transactions the normal way of working. It also has `JSONB` columns, which store and index arbitrary JSON, so you can keep the flexible parts flexible.
+
+Look at what DukaanVoice actually stores:
+
+- An order references a shop, a customer and several products.
+- Stock must never go below zero, even when orders race.
+- Money must add up: line totals, order totals, payments, refunds.
+- The shopkeeper asks questions like "what sold most this week?", which is a join and a group-by.
+
+That is relational data with strong invariants. The schema-up-front cost of Postgres pays for itself in constraints that the database enforces for you, at 3 am, even when the application code has a bug.
+
+<Decision id="sql-vs-document" />
+
+## The schema
+
+Here is the core of the DukaanVoice schema. Two conventions are set here and explained properly in lesson 5: IDs are UUIDs, and money is stored as integer **paise** (₹1 = 100 paise), never as a decimal rupee amount in a floating-point number.
+
+<Diagram
+  fig="4.1"
+  caption="The core tables. Every tenant-owned table carries shop_id."
+  label="Entity relationship diagram: a shop has many staff users, products, customers and orders. An order belongs to one customer and has many order items, each referencing a product. An order has payments. Messages belong to a shop and a customer."
+  chart={`erDiagram
+  SHOPS ||--o{ STAFF : employs
+  SHOPS ||--o{ PRODUCTS : sells
+  SHOPS ||--o{ CUSTOMERS : serves
+  SHOPS ||--o{ ORDERS : receives
+  CUSTOMERS ||--o{ ORDERS : places
+  ORDERS ||--|{ ORDER_ITEMS : contains
+  PRODUCTS ||--o{ ORDER_ITEMS : "appears in"
+  ORDERS ||--o{ PAYMENTS : "paid by"
+  CUSTOMERS ||--o{ MESSAGES : sends
+`}
+/>
+
+```sql title="migrations/001_core.sql"
+CREATE TABLE products (
+  id           uuid PRIMARY KEY,
+  shop_id      uuid NOT NULL REFERENCES shops(id),
+  name         text NOT NULL,              -- "Aashirvaad Atta 5 kg"
+  brand        text,
+  unit         text NOT NULL,              -- "kg", "packet", "litre"
+  price_paise  integer NOT NULL CHECK (price_paise >= 0),
+  stock        integer NOT NULL CHECK (stock >= 0),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id           uuid PRIMARY KEY,
+  shop_id      uuid NOT NULL REFERENCES shops(id),
+  customer_id  uuid NOT NULL REFERENCES customers(id),
+  status       text NOT NULL,              -- draft, confirmed, paid, packed, delivered, cancelled
+  total_paise  integer NOT NULL CHECK (total_paise >= 0),
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_items (
+  order_id          uuid NOT NULL REFERENCES orders(id),
+  product_id        uuid NOT NULL REFERENCES products(id),
+  name_snapshot     text NOT NULL,         -- what the customer saw
+  unit_price_paise  integer NOT NULL,      -- price at time of order
+  qty               integer NOT NULL CHECK (qty > 0),
+  PRIMARY KEY (order_id, product_id)
+);
+```
+
+A few choices worth noticing:
+
+- **`CHECK (stock >= 0)`** means the database itself refuses to oversell, even if a bug in the code tries. Constraints are your last line of defence, and they cost one line each.
+- **Order items snapshot the name and price.** If Ravi raises the price of atta tomorrow, last week's orders must still show what the customer actually paid. Your Mongo instinct to embed the product inside the order was right about this one thing; in Postgres you do it with snapshot columns.
+- **`timestamptz`** stores an absolute moment in time. Lesson 5 explains why you never use plain `timestamp`.
+- **`status` is text** with values defined in code. Lesson 5 covers enums versus lookup tables.
+- **`shop_id` on every tenant-owned table**, even where you could get it through a join. More on that below.
+
+## Indexes, and how they actually work
+
+You have used indexes in Mongo. The mental model is the same in Postgres, but it is worth making it precise because index design is where most database performance comes from.
+
+The default index is a **B-tree**: a balanced tree of sorted keys, where each node holds many keys and the leaves point to the actual rows. Finding a key is a walk from the root to a leaf, which takes a handful of page reads even for hundreds of millions of rows. You know this as O(log n) from DSA; in practice the tree is so wide that it is three or four levels deep.
+
+Because the keys are **sorted**, a B-tree can answer equality (`shop_id = X`), ranges (`created_at > yesterday`) and ordering (`ORDER BY created_at DESC`) without scanning the table.
+
+### Composite indexes and column order
+
+The most common DukaanVoice query is "this shop's recent orders":
+
+```sql
+SELECT * FROM orders WHERE shop_id = $1 ORDER BY created_at DESC LIMIT 20;
+```
+
+The right index is a **composite index** on `(shop_id, created_at)`. Think of it as a phone book sorted by surname, then first name. All of one shop's orders sit together, already sorted by time, so Postgres jumps to the shop and reads the first 20 entries.
+
+Column order matters. An index on `(shop_id, created_at)` helps queries that filter by `shop_id`, and by `shop_id` plus a time range. It does **not** help a query that filters only by `created_at`, just as a phone book sorted by surname cannot find everyone called "Imran". This is the **leftmost prefix rule**. A good default for multi-tenant tables: put `shop_id` first.
+
+### Indexes are not free
+
+Every index makes reads faster and writes slower, because each insert or update must also update every index on the table. Indexes also take memory; when they no longer fit in RAM, performance drops sharply. So:
+
+- Index for the queries you actually run. Use `EXPLAIN ANALYZE` to see whether a query uses an index or scans the table.
+- Use **partial indexes** for hot subsets, for example `CREATE INDEX ON orders (shop_id, created_at) WHERE status = 'confirmed'` for the "orders to pack" screen.
+- Do not index low-cardinality columns on their own (like `status` with six values); the database often ignores them anyway.
+
+## Transactions and the oversold atta
+
+Back to the four bags. The bug was a classic **race condition**, specifically a lost update:
+
+1. Request A reads stock = 3. Request B reads stock = 3.
+2. A checks 3 ≥ 1, writes stock = 2. B checks 3 ≥ 2, writes stock = 1.
+3. Final stock is 1, but three bags were promised.
+
+Each request was correct on its own. They were wrong together, because the read and the write were separate steps and the other request slipped in between them.
+
+A **transaction** groups several statements so they succeed or fail together. You will hear the acronym ACID: Atomic (all or nothing), Consistent (constraints hold), Isolated (concurrent transactions do not see each other's half-finished work), Durable (committed data survives a crash). But a transaction alone does not fix this bug. Postgres's default isolation level, Read Committed, still lets two transactions read the same old value. You need the read-check-write to be a single atomic step.
+
+### Fix 1: a conditional update
+
+The simplest fix moves the check into the write:
+
+```ts title="modules/catalog/reserve.ts"
+// Reserve stock for every line of an order, atomically. Throws if any item is short.
+export async function reserveStock(tx: Tx, shopId: string, items: { productId: string; qty: number }[]) {
+  // Lock rows in a consistent order so two orders can never deadlock each other
+  const sorted = [...items].sort((a, b) => a.productId.localeCompare(b.productId));
+  for (const { productId, qty } of sorted) {
+    const { rowCount } = await tx.query(
+      `UPDATE products SET stock = stock - $3, updated_at = now()
+       WHERE id = $1 AND shop_id = $2 AND stock >= $3`,
+      [productId, shopId, qty],
+    );
+    if (rowCount === 0) throw new OutOfStockError(productId); // caller rolls back the whole tx
+  }
+}
+```
+
+The `UPDATE ... WHERE stock >= $3` takes a row lock, re-checks the condition against the **current** value, and either decrements or matches zero rows. The second request waits for the first to commit, then sees the new stock. If any item is short, the whole transaction rolls back and nothing was reserved.
+
+Note the sort. If order A locks atta then dal, and order B locks dal then atta, each can end up waiting for the other forever: a **deadlock**. Postgres detects it and kills one transaction, but it is better to avoid it by always locking rows in the same order.
+
+### Fix 2: lock, then decide
+
+When the decision needs more logic than fits in a `WHERE` clause, use `SELECT ... FOR UPDATE`. It reads the rows and locks them until your transaction ends, so nobody else can change them while you think. Keep those transactions short: a lock held while you call an LLM is a lock held for three seconds, and every other order for that product queues behind it.
+
+### Reserve at confirmation, release on timeout
+
+One more business decision hides here. When should stock be taken? DukaanVoice reserves stock when the customer **confirms**, not when the draft is built, and releases it if payment does not arrive within 15 minutes (or the shop allows cash on delivery). Otherwise a customer who never replies would hold atta hostage all evening.
+
+<Decision id="stock-locking" />
+
+## Multi-tenancy: keeping shops apart
+
+Every shop is a **tenant**: a customer of DukaanVoice whose data must be isolated from every other tenant. There are three standard ways to do it.
+
+<Diagram
+  fig="4.2"
+  caption="Three tenancy models, from cheapest to most isolated."
+  label="Three tenancy models side by side. Shared tables: all shops in one set of tables, separated by a shop_id column. Schema per tenant: one database with a separate schema for each shop. Database per tenant: a separate database for each shop."
+  chart={`flowchart TD
+  subgraph S1["Shared tables"]
+    T1[("orders: shop_id A, B, C ...")]
+  end
+  subgraph S2["Schema per tenant"]
+    T2a[("shop_a.orders")]
+    T2b[("shop_b.orders")]
+  end
+  subgraph S3["Database per tenant"]
+    T3a[("db_shop_a")]
+    T3b[("db_shop_b")]
+  end
+  S1 -.->|"more isolation, more ops"| S2
+  S2 -.->|"more isolation, more ops"| S3
+`}
+/>
+
+- **Shared tables with a `shop_id` column.** One schema, one migration, efficient use of resources, easy cross-shop analytics for you as the platform. The risk is a query that forgets `WHERE shop_id = ...` and leaks data.
+- **Schema per tenant.** Each shop gets its own Postgres schema with identical tables. Better isolation, but 50,000 schemas means 50,000 copies of every table and every migration, and connection pooling gets awkward.
+- **Database per tenant.** Strongest isolation, per-tenant backups and restores, easy to delete a tenant entirely. Operationally heavy, and only sensible for a small number of large tenants.
+
+For 50,000 small, similar shops, shared tables are the standard answer. The risk of a missing filter is real, so you defend in depth:
+
+1. Every repository function takes `shopId` as a required argument. There is no `getOrder(id)`, only `getOrder(shopId, id)`.
+2. **Postgres row-level security** (RLS) as a backstop. The database itself filters rows by a per-connection setting, so even a buggy query cannot read another shop's data.
+
+```sql title="migrations/002_rls.sql"
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON orders
+  USING (shop_id = current_setting('app.shop_id')::uuid);
+
+-- In each request's transaction, before any query:
+--   SET LOCAL app.shop_id = '<the authenticated shop id>';
+```
+
+RLS has a cost: a little query overhead, and you must make sure your application connects as a role that RLS applies to (table owners and superusers bypass it by default). It is worth it. Tenant data leaks are the kind of bug that ends a B2B company's reputation.
+
+<Decision id="tenancy-model" />
+
+## What the architecture looks like now
+
+Nothing new on the architecture diagram, and that is the point. The single Postgres from lesson 3 now has a schema with constraints, composite indexes starting with `shop_id`, atomic stock reservation with a 15-minute release, and row-level security. Ravi will not oversell atta again, and the shop next door cannot see his prices. Those guarantees live in the database, where a bug in tomorrow's code cannot remove them.
+
+## Interview angle
+
+<Interview
+  ask="Two customers try to buy the last item at the same time. What happens in your design?"
+  mistake="Answering “we check stock before we insert the order”. That check-then-act is exactly the race. Interviewers want to hear how the check and the write become one atomic step."
+>
+
+- You name the problem: a race condition, specifically a lost update between read and write.
+- You give a concrete fix: a conditional `UPDATE ... WHERE stock >= qty` or `SELECT ... FOR UPDATE` inside a short transaction, plus a `CHECK` constraint as a backstop.
+- You mention lock ordering to avoid deadlocks, and keeping locks short (never hold one across a network call).
+- For data modeling questions generally: you justify SQL vs NoSQL from the access patterns and invariants, not from preference, and you design indexes from the actual queries.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Choose the database from your access patterns and invariants. Orders, stock and money are relational; Postgres's JSONB covers the flexible parts.
+- Let the database enforce invariants with `NOT NULL`, `CHECK` and foreign keys; snapshot prices on order items.
+- B-tree composite indexes follow the leftmost prefix rule. For multi-tenant tables, `shop_id` usually comes first.
+- Check-then-write is a race. Make it atomic with a conditional update or a row lock, lock rows in a consistent order, and keep transactions short.
+- Shared tables with `shop_id` plus row-level security is the default multi-tenancy model for many small tenants.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Which index best serves `WHERE shop_id = $1 ORDER BY created_at DESC LIMIT 20` on the orders table?",
+      options: [
+        "A composite index on (shop_id, created_at)",
+        "A composite index on (created_at, shop_id)",
+        "Two separate indexes, one on shop_id and one on created_at",
+        "An index on status, since most queries filter on it",
+      ],
+      answer: "A",
+      why: "With shop_id first, all of a shop's orders are contiguous and already sorted by time, so the database reads 20 entries and stops. With created_at first, one shop's orders are scattered across the whole index. Two single-column indexes cannot deliver the sorted, filtered result as efficiently.",
+    },
+    {
+      q: "Wrapping “read stock, check it, write new stock” in a transaction at Postgres's default isolation level. Does that prevent overselling?",
+      options: [
+        "Yes, transactions always prevent concurrent updates to the same row",
+        "Yes, as long as the transaction commits quickly",
+        "No. Two transactions can still read the same old value; the check and write must be one atomic step or the row must be locked",
+        "No, because Postgres does not support transactions on integer columns",
+      ],
+      answer: "C",
+      why: "Read Committed lets both transactions read stock = 3 before either writes. You need a conditional UPDATE, SELECT ... FOR UPDATE, or a stricter isolation level with retries. Speed does not remove the race; it only makes it rarer.",
+    },
+    {
+      q: "DukaanVoice uses shared tables for 50,000 shops. What is the main purpose of adding Postgres row-level security on top of `WHERE shop_id = ...` in the code?",
+      options: [
+        "It makes tenant-filtered queries significantly faster",
+        "It is a database-enforced backstop, so a query that forgets the shop filter still cannot read another shop's rows",
+        "It replaces the need for a shop_id column",
+        "It encrypts each shop's data with a separate key",
+      ],
+      answer: "B",
+      why: "RLS is defence in depth: the database applies the tenant filter even when application code forgets it. It adds a little overhead rather than speed, still relies on the shop_id column, and has nothing to do with encryption.",
+    },
+  ]}
+/>

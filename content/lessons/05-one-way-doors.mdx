@@ -1,3 +1,253 @@
 ## The problem
 
-Coming soon.
+DukaanVoice is at 500 shops and about 15,000 orders a day. Things mostly work. Then, in one bad week:
+
+- A competitor's sales deck says "DukaanVoice processes about 14,000 orders a day". They worked it out by placing a test order on Monday and another on Tuesday, and subtracting the order numbers.
+- A customer in Vijayawada is charged twice for one order. Her phone lost signal right after she tapped "pay", the app retried, and the server created a second payment link.
+- The "today's sales" card on every dashboard is wrong between midnight and 5:30 am.
+- A shopkeeper scrolling through order history sees the same order twice and misses another one entirely.
+
+None of these are hard bugs. Each one comes from a decision made in an afternoon during week one, and each one is now expensive to change, because there are millions of rows and thousands of installed apps built on top of it.
+
+Jeff Bezos called these **one-way doors**: decisions that are hard or impossible to reverse, as opposed to two-way doors you can walk back through. Most decisions are two-way doors and should be made quickly. This lesson is a tour of the small ones that are secretly one-way, with what goes wrong later and the cheap fix you can make on day one.
+
+## 1. IDs
+
+**What goes wrong later.** Auto-incrementing integer IDs (`1, 2, 3...`) are the default in many tutorials. They leak your business volume, as DukaanVoice just found out. They invite enumeration: if `/orders/1043` works, someone will try `/orders/1044`, and if you ever forget an authorisation check, that is a data leak (called an IDOR, insecure direct object reference). They need one central counter, so you cannot generate them on a phone that is offline or merge two databases without collisions.
+
+Random **UUIDv4** fixes all of that, but creates a performance problem. Each new ID lands at a random place in the primary key's B-tree, so inserts touch pages all over the index instead of the end, which wastes cache and causes more page splits on large tables.
+
+**Cheap fix now.** Use a time-ordered unique ID: **UUIDv7** (standardised in RFC 9562 in 2024) or **ULID**. The first bits are a timestamp, the rest are random. New IDs sort roughly by creation time, so inserts land near the end of the index like integers do, but they are globally unique and can be created anywhere, including on an offline phone. Postgres 18 added a built-in `uuidv7()` function; on older versions, generate them in the application.
+
+```ts
+import { v7 as uuidv7 } from "uuid";
+
+const orderId = uuidv7(); // e.g. "0192f3c4-8a1e-7c3b-9d2e-4f5a6b7c8d9e", sorts by time
+```
+
+People still want short numbers to read out over the phone. Give them a separate per-shop **display number** ("Order 0193 at Sri Lakshmi Kirana"), generated per shop and never used as a key. Your competitor learns how busy one shop is, not the whole platform.
+
+<Decision id="id-format" />
+
+## 2. Money
+
+**What goes wrong later.** In JavaScript, `0.1 + 0.2` is `0.30000000000000004`. Floating-point numbers cannot represent most decimal fractions exactly. Store ₹49.90 as a float, add up a few thousand orders, apply 18% GST, round in three places, and the shop's report is off by a few paise from the payment gateway's settlement. Accountants notice. Reconciliation scripts fail. Now you need to migrate every money column in a live database.
+
+**Cheap fix now.** Store money as an **integer number of the smallest unit**: paise. ₹49.90 is `4990`. Integers add exactly. Name the column so the unit is obvious (`price_paise`), and keep the currency explicit if there is any chance of a second one. Convert to rupees only when displaying.
+
+Two details worth knowing. A Postgres `integer` tops out at about 2.1 billion, which is ₹2.1 crore in paise: fine for a single order, too small for a platform-wide revenue sum, so aggregates use `bigint`. And JavaScript numbers are exact for integers up to 2^53, which comfortably covers any paise value you will see. Decide your rounding rule once (for example, GST computed per line and rounded half-up to the paisa) and put it in one function.
+
+## 3. Time
+
+**What goes wrong later.** The "today's sales" bug. The server computed "today" as midnight to midnight in **UTC**. India is UTC+5:30, so every order placed between midnight and 5:30 am IST was counted in the wrong day. Worse, some early rows were stored as `timestamp without time zone`, holding a local time with no record of which zone it was in. Nobody can be sure, years later, what those values meant.
+
+**Cheap fix now.** Three rules:
+
+1. Store moments as **UTC instants**: `timestamptz` in Postgres, ISO 8601 strings with a `Z` or offset in APIs (`2025-10-20T14:12:00Z`).
+2. Store the **shop's time zone** (`Asia/Kolkata`) as data. India has one zone today, but you may expand to Nepal or the Gulf, and a "shop day" is a business concept that deserves a column.
+3. Convert to local time only at the edges: when you compute a business day boundary or format a date for display. India does not observe daylight saving, but the next country you expand to might, and code that assumes every day has 24 hours will break.
+
+## 4. Deleting things
+
+**What goes wrong later.** A shopkeeper deletes a product he no longer stocks. A `DELETE` removes the row, and suddenly last month's orders reference a product that does not exist (or the delete fails because of the foreign key, and he cannot remove it at all). Another time, a support agent deletes a customer by mistake and there is no undo.
+
+**Cheap fix now.** Decide per table:
+
+- **Soft delete** (a `deleted_at` or `archived_at` column) for business records that other records point at: products, shops, staff. Hide them from normal queries and keep the history intact. If the table has unique constraints, make them partial (`UNIQUE (shop_id, name) WHERE archived_at IS NULL`) so a deleted product's name can be reused.
+- **Hard delete** for personal data you are obliged to erase, and for data whose purpose is over. Under India's DPDP Act, keeping personal data "just in case" is not a valid purpose (lesson 16). A customer who asks to be erased must actually disappear, which means deleting or anonymising their phone number and voice notes even if their orders remain as anonymous sales records.
+
+Soft-deleting everything feels safe and quietly turns into a privacy problem. Decide deliberately.
+
+## 5. Idempotency keys
+
+**What goes wrong later.** The double charge. The app sent "create payment link for order X", the server created it, and the response was lost when the phone's network dropped. The app did the reasonable thing and retried. The server created a second link. The customer paid both.
+
+An operation is **idempotent** if doing it twice has the same effect as doing it once. `GET`, `PUT` and `DELETE` are meant to be idempotent; `POST` is not. Networks lose responses all the time, so any client that retries a non-idempotent request will eventually do something twice.
+
+**Cheap fix now.** Have clients send an **idempotency key**: a unique ID generated once per logical action, sent in an `Idempotency-Key` header and reused on every retry of that action. The server records the key with the response. If the same key comes back, it returns the stored response instead of doing the work again. Payment providers such as Stripe and many Indian gateways work this way, and your own API should too.
+
+<Diagram
+  fig="5.1"
+  caption="An idempotency key turns a retry into a replay. The second request gets the first response; no second payment link is created."
+  label="Sequence: the app sends a POST with an idempotency key. The server stores the key as in progress, creates a payment link, stores the response, and replies, but the response is lost. The app retries with the same key; the server finds the stored response and returns it without creating another link."
+  chart={`sequenceDiagram
+  participant App
+  participant API
+  participant DB as Postgres
+  participant PG as Payment gateway
+  App->>API: POST /payment-links (Idempotency-Key: k1)
+  API->>DB: insert key k1, status in_progress
+  API->>PG: create link
+  PG-->>API: link L1
+  API->>DB: store response for k1
+  API--xApp: response lost (network drop)
+  App->>API: retry, same Idempotency-Key k1
+  API->>DB: find k1, completed
+  API-->>App: same response, link L1
+`}
+/>
+
+```ts title="shared/idempotency.ts"
+// Express middleware: replay stored responses for repeated Idempotency-Key values.
+export function idempotent() {
+  return async (req: Req, res: Res, next: Next) => {
+    const key = req.header("Idempotency-Key");
+    if (!key) return res.status(400).json({ error: { code: "idempotency_key_required" } });
+    const scope = `${req.user.shopId}:${req.method}:${req.path}:${key}`;
+
+    // Unique constraint on scope: only one request can claim a key
+    const claimed = await db.query(
+      `INSERT INTO idempotency_keys (scope, status, request_hash) VALUES ($1, 'in_progress', $2)
+       ON CONFLICT (scope) DO NOTHING`, [scope, hash(req.body)]);
+
+    if (claimed.rowCount === 0) {
+      const prev = await db.one(`SELECT * FROM idempotency_keys WHERE scope = $1`, [scope]);
+      if (prev.request_hash !== hash(req.body)) return res.status(422).json({ error: { code: "key_reused_with_different_body" } });
+      if (prev.status === "in_progress") return res.status(409).json({ error: { code: "request_in_progress" } });
+      return res.status(prev.response_status).json(prev.response_body); // replay
+    }
+
+    res.on("finish", () => saveResponse(scope, res.statusCode, res.locals.body)); // persist for replays
+    next();
+  };
+}
+```
+
+Three details make this correct rather than approximately correct. The unique constraint means two simultaneous retries cannot both claim the key. The request hash catches a client bug that reuses a key for a different request. And keys expire after a day or so, so the table does not grow forever. The same idea, deduplication by a unique ID, will protect your queue consumers in lesson 7 and your webhook handlers too.
+
+## 6. Pagination
+
+**What goes wrong later.** The duplicated and missing orders. The order history used **offset pagination**: page 2 is `LIMIT 20 OFFSET 20`. While the shopkeeper read page 1, three new orders arrived at the top. Page 2 now starts three rows earlier than it should, so he sees three orders again. Delete one and he would skip one instead. Offsets also get slower the deeper you go, because the database still has to walk past every skipped row: `OFFSET 100000` reads 100,020 rows to return 20.
+
+**Cheap fix now.** Use **cursor (keyset) pagination**. Instead of "skip N rows", the client says "give me 20 rows after this one", and the server uses the index to jump straight there:
+
+```sql
+-- cursor = (created_at, id) of the last row the client saw
+SELECT * FROM orders
+WHERE shop_id = $1 AND (created_at, id) < ($2, $3)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+The `id` is a tiebreaker so two orders in the same millisecond are never skipped. The API returns an opaque `nextCursor` string (base64 of those two values) so you can change the internals later. Offsets remain fine for small admin tables where someone genuinely wants "page 7 of 12".
+
+<Decision id="pagination" />
+
+## 7. Sessions or JWTs
+
+**What goes wrong later.** A shopkeeper's phone is stolen from his counter. He calls support: "log me out everywhere, now". If the app authenticates with a **JSON Web Token** (JWT), a signed token that any server can verify on its own without a database lookup, the honest answer is "your token stays valid until it expires". Making JWTs revocable means keeping a list of revoked tokens and checking it on every request, which is a session store with extra steps.
+
+**Cheap fix now.** For one first-party API serving your own app and dashboard, **opaque session tokens** stored server-side (in Redis or Postgres) are simpler and safer: random IDs that point to a session record, revocable instantly, with a natural place to list a user's devices. Send them as `HttpOnly`, `Secure`, `SameSite` cookies on the web (so page JavaScript cannot read them) and as bearer tokens in the mobile app's secure storage. JWTs earn their place when many independent services or third parties must verify identity without sharing a store; if you use them, keep them short-lived (minutes) and pair them with revocable refresh tokens.
+
+<Decision id="sessions-vs-jwt" />
+
+## 8. Where files live
+
+**What goes wrong later.** Someone stores voice notes as `bytea` in Postgres "just for the pilot". A year later the database is 4 TB, backups take all night, and replicas fall behind copying audio nobody reads.
+
+**Cheap fix now.** Files go in **object storage** (S3 or an equivalent). The database stores only the key. The bucket is private; clients get time-limited **signed URLs** (pre-signed URLs) that grant access to one object for a few minutes. Design the key layout up front, because it determines what is cheap later:
+
+```text
+shops/{shopId}/voice/{yyyy}/{mm}/{messageId}.ogg
+```
+
+With the shop as a prefix, deleting a departing shop's audio is one prefix delete, and per-tenant storage reporting is trivial. With the date in the path, a storage **lifecycle rule** can delete audio older than 30 days automatically. That rule will be your data-retention policy in lesson 16.
+
+## 9. Enums and status values
+
+**What goes wrong later.** Two different things. First, Postgres native `ENUM` types make it easy to add a value but awkward to remove or rename one. Second, and much worse: you add a new order status, `out_for_delivery`. Version 1.4 of the mobile app, still installed on thousands of phones, has a `switch` over statuses with no default case and crashes on the order screen.
+
+**Cheap fix now.** Store statuses as `text` with a `CHECK` constraint, or as a small lookup table if shops need custom values, and define the allowed list in your shared contracts package. In every client, treat **unknown values as a normal case**: show a generic label and keep working. This principle has a name, the **tolerant reader**: read what you understand, ignore what you do not, never crash on something new.
+
+## 10. API versions for apps that never update
+
+**What goes wrong later.** On the web, every user gets the new frontend on their next page load. Mobile is different. A shopkeeper on an old Android phone with auto-update off may run the same app version for two years. Every field you rename and every endpoint you remove breaks somebody you cannot reach.
+
+**Cheap fix now.**
+
+- Version the API from day one (`/v1`, from lesson 3).
+- Within a version, make only **additive** changes: new optional fields, new endpoints. Never rename, remove or change the meaning of a field.
+- Have the app send its version on every request (`X-App-Version: 1.4.2`). Log it. That is how you find out how many people still run 1.4 before you break them.
+- Ship a **minimum supported version** check from the very first release: an endpoint the app calls on launch that can say "please update". If version 1.0 does not have this, you can never force anyone off version 1.0. Lesson 19 covers the update UX.
+
+## 11. Names and contracts
+
+**What goes wrong later.** `price` in one API is rupees, in another it is paise. `time` is seconds in one place and milliseconds in another. `createdAt` here, `created_at` there, `creationDate` in the third endpoint. Every integration needs a phone call.
+
+**Cheap fix now.** Write a one-page convention and enforce it in code review:
+
+- **Units in names:** `price_paise`, `duration_ms`, `weight_grams`, `audio_seconds`.
+- **One casing per layer:** `snake_case` in the database, `camelCase` in JSON, converted in one place.
+- **Booleans read as questions:** `is_active`, `has_gst`.
+- **Events in the past tense:** `order.confirmed`, `payment.captured`.
+- **Shared types** in one package (`packages/contracts`) with Zod schemas used by the API, the dashboard and the app, so the contract is code, not a wiki page.
+
+## The pattern behind all eleven
+
+Every item has the same shape: a decision that takes five minutes on day one, whose cost of change grows with every row stored and every app installed. You cannot get everything right in advance. But you can learn to recognise the decisions that leak into **data at rest** (IDs, money, time, deletes, file layout) and into **contracts with clients you do not control** (API shapes, enum values, version checks). Those are the one-way doors. Slow down for those, and move fast on everything else.
+
+## Interview angle
+
+<Interview
+  ask="The client retries a payment request after a timeout. How do you make sure the customer is not charged twice?"
+  mistake="Saying “we check whether a payment already exists for this order”. Under concurrency that check races just like the stock check in lesson 4. The answer is a unique idempotency key enforced by a database constraint."
+>
+
+- You define idempotency and explain why retries are inevitable on real networks.
+- You describe the key: generated by the client once per action, stored with a unique constraint, mapped to the stored response, with a request hash and an expiry.
+- You mention the in-progress state for concurrent duplicates.
+- Bonus points: you connect it to the payment provider's own idempotency support and to deduplicating webhooks and queue messages.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Most decisions are two-way doors; spot the one-way ones, which leak into stored data or into clients you cannot update.
+- Use time-ordered UUIDs (UUIDv7 or ULID), integer paise for money, UTC `timestamptz` with the shop's zone as data.
+- Every non-idempotent operation that a client may retry needs an idempotency key with a unique constraint.
+- Prefer cursor pagination, revocable sessions, private object storage with signed URLs, and text statuses read tolerantly.
+- Ship a minimum-supported-version check in your very first mobile release.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Why is UUIDv7 usually a better primary key than UUIDv4 for a large orders table?",
+      options: [
+        "UUIDv7 values are shorter, so they use less storage",
+        "UUIDv7 values are guaranteed unique across the internet, and UUIDv4 values are not",
+        "UUIDv7 values start with a timestamp, so new rows land near the end of the B-tree index instead of at random positions",
+        "UUIDv7 values can be decoded to reveal the shop that created them",
+      ],
+      answer: "C",
+      why: "Both are 128 bits, and both are unique for all practical purposes. The difference is ordering: time-prefixed IDs give insert locality similar to auto-increment, which keeps index pages hot and reduces page splits. They do not encode the shop.",
+    },
+    {
+      q: "A shop's order history uses OFFSET pagination. New orders keep arriving while the shopkeeper scrolls. What does he most likely see?",
+      options: [
+        "An error once the offset is larger than the number of new orders",
+        "Exactly the right orders, because OFFSET is evaluated once per session",
+        "Only orders created before he opened the screen",
+        "Some orders repeated on the next page, because new rows at the top shift every later page down",
+      ],
+      answer: "D",
+      why: "OFFSET counts rows from the top at query time. New rows push older ones down, so page 2 starts with rows already shown on page 1. Nothing is frozen per session. Cursor pagination anchors on the last row seen instead.",
+    },
+    {
+      q: "Which approach correctly prevents a double charge when the app retries “create payment link”?",
+      options: [
+        "The app sends an idempotency key, the server claims it with a unique constraint and replays the stored response for repeats",
+        "The server checks whether a link already exists for the order before creating one",
+        "The app waits 30 seconds before retrying, so the first request has time to finish",
+        "The server makes the endpoint a GET request, since GET requests are idempotent",
+      ],
+      answer: "A",
+      why: "Check-then-create races when two retries arrive together. Waiting longer only makes the race rarer. Calling it GET does not change what it does and breaks HTTP semantics. A unique, client-generated key enforced by the database makes the retry a replay.",
+    },
+  ]}
+/>
