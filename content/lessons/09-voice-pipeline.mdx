@@ -1,3 +1,239 @@
 ## The problem
 
-Coming soon.
+Support tickets from the last two weeks fall into three piles.
+
+- **"It's slow."** Customers wait 8 or 9 seconds for a reply, sometimes longer. Some send the voice note again, which creates a second job.
+- **"It got my order wrong."** Mostly from customers who mix Telugu and English: "rendu kilo sugar, oka Surf Excel pampandi" (two kilos of sugar, send one Surf Excel). Also from customers who say "dhai kilo" (two and a half kilos) and get 2.
+- **"It didn't understand me at all."** Voice notes recorded at the counter with a pressure cooker whistling in the background.
+
+The team has been treating "the voice part" as one black box. This lesson opens it up into stages, gives each stage a time budget, and fixes the language and noise problems where they actually live.
+
+## The pipeline, stage by stage
+
+A voice note goes through a **cascaded pipeline**: separate components for speech recognition, understanding and response, each passing text to the next.
+
+<Diagram
+  fig="9.1"
+  caption="The voice pipeline. Each stage has an owner, a time budget and its own metrics."
+  label="Voice pipeline: a WhatsApp webhook is acknowledged and queued. A worker fetches the media from Meta and stores it in object storage, sends it to speech-to-text with language and vocabulary hints, normalises the transcript, extracts items with an LLM, matches them against the shop's catalog, checks stock and prices in Postgres, builds a text summary from a template and sends it on WhatsApp. If speech-to-text fails or has low confidence, the customer is asked to type or clarify."
+  chart={`flowchart TD
+  A["Webhook: ack and enqueue"] --> B["Fetch media from Meta"]
+  B --> S3[("Object storage: audio")]
+  B --> C["Speech-to-text with language and vocabulary hints"]
+  C -->|"low confidence or failure"| X["Ask the customer to type or repeat"]
+  C --> D["Normalise: numbers, units, script"]
+  D --> E["LLM: extract items and quantities"]
+  E --> F["Match items to catalog"]
+  F --> G["Check stock and price in Postgres"]
+  G --> H["Build summary from a template"]
+  H --> I["Send on WhatsApp"]
+`}
+/>
+
+The alternative is a **speech-to-speech** model that takes audio in and produces audio out, with no text in between. Those models are excellent for live conversation, where every hundred milliseconds of silence feels awkward. For DukaanVoice's voice notes, the cascade wins clearly:
+
+- The **transcript is inspectable**. When an order is wrong, you can see whether the error came from hearing or from understanding. That is half of debugging and evaluation (lesson 15).
+- **Each stage is swappable.** You can change the speech-to-text vendor without touching the extraction prompt.
+- **It is cheaper**, and the text in the middle can be cached, redacted and logged.
+
+A voice note is not a live call: the customer recorded it, sent it, and put the phone down. A few seconds is fine. Fifteen is not.
+
+## A latency budget
+
+"It's slow" is not actionable. A **latency budget** is: you take the end-to-end target and split it across stages, so each stage has a number it must meet and an owner who watches it.
+
+DukaanVoice's target, set in lesson 2, is **p95 under 6 seconds** from webhook received to summary sent. After instrumenting every stage with timing spans, here is the budget the team agreed on:
+
+| Stage | p50 today | p95 budget |
+| --- | --- | --- |
+| Webhook verify, dedupe, enqueue | 40 ms | 100 ms |
+| Wait in queue | 150 ms | 500 ms |
+| Fetch media from Meta | 350 ms | 800 ms |
+| Speech-to-text, 8 s of audio | 900 ms | 1,600 ms |
+| Normalise transcript | 5 ms | 20 ms |
+| LLM item extraction | 1,100 ms | 2,000 ms |
+| Catalog match and stock check | 80 ms | 300 ms |
+| Build summary and send on WhatsApp | 300 ms | 700 ms |
+| **Total** | **about 2.9 s** | **6 s** |
+
+Two subtleties. First, the p95s of each stage do not add up to the p95 of the whole: it is rare for every stage to be slow on the same request, so summing stage p95s overestimates the total. That makes the table a conservative budget, which is what you want. Second, the measurements showed the original 9-second p95 was not caused by any one stage. It came from queue wait during peaks (fixed by autoscaling workers on queue depth, lesson 18) and from an extraction prompt that asked the model to "explain your reasoning" before the JSON, adding about 250 output tokens of text nobody read.
+
+### Making the wait feel shorter
+
+Some delay is unavoidable, so manage how it feels:
+
+- **Mark the message as read** as soon as the job starts, so the customer sees the blue ticks. WhatsApp's API also offers a typing indicator; check the current documentation for how it behaves.
+- If a job passes about 4 seconds (say, a long voice note), send a short holding message: "Got it, checking stock...". This is cheap and stops customers re-sending.
+- Never send the holding message for fast jobs. Two messages where one would do is noise.
+
+### Streaming: where it helps and where it does not
+
+Streaming is often the first answer to "make the AI faster", so be precise about where it helps:
+
+- **Streaming speech-to-text** transcribes audio while it is still arriving. For a voice note that arrives complete, there is nothing to stream; you send the whole 8 seconds at once.
+- **Streaming LLM output** helps when a person watches the text appear. WhatsApp delivers whole messages, and the extraction output is JSON that must be validated before anyone sees it, so streaming saves nothing here.
+- Streaming **does** matter in the shopkeeper app, covered below, and for any future live phone-call channel.
+
+## Code-mixed language
+
+Most customers do not speak one language at a time. "Rendu kilo sugar, oka Surf Excel pampandi" switches between Telugu and English within a sentence. This is **code-mixing**, and it is the normal case for DukaanVoice.
+
+What helps, in the order the team discovered it:
+
+1. **Pick a speech-to-text model that handles code-mixing well, by testing it on your audio.** Vendor accuracy claims are measured on their test sets, not on a kirana counter in Guntur. Build a small labelled set of real voice notes (with consent) and measure **word error rate** (WER) per language mix. Several global and Indian vendors offer models trained specifically on Indian languages; results differ a lot by language pair and accent.
+2. **Give the recogniser hints.** Many speech-to-text APIs accept a language hint, and some accept a text prompt or a list of phrases to bias recognition. Passing the shop's top brand names ("Aashirvaad", "Surf Excel", "Parle-G", "Fortune") cuts brand-name errors noticeably. Use the shop's configured languages as hints rather than forcing one language.
+3. **Expect mixed scripts in the output.** The same word can come back in Latin script ("atta"), Devanagari ("आटा") or Telugu script. Pick one representation for matching. DukaanVoice keeps the original transcript for auditing, and adds a romanised version for matching against the catalog, which lesson 12 searches with fuzzy text matching.
+4. **Normalise quantities with rules, not the model.** Indian quantity words are a small, closed set: "aadha" (half), "paav" (a quarter, often 250 g), "sava" (one and a quarter), "dedh" (one and a half), "dhai" (two and a half). A deterministic lookup table converts them reliably and is easy to test. Asking the LLM to also do arithmetic on Hindi fractions is asking for the "dhai kilo became 2" bug.
+
+```ts title="voice/normalise.ts"
+// Deterministic quantity words. Extend per language; unit-test every entry.
+const FRACTION_WORDS: Record<string, number> = {
+  aadha: 0.5, adha: 0.5, paav: 0.25, pav: 0.25,
+  sava: 1.25, dedh: 1.5, dhai: 2.5, ara: 0.5, // "ara" = half, in Telugu (romanised)
+};
+
+export function normaliseQuantities(text: string) {
+  return text.replace(/\b(aadha|adha|paav|pav|sava|dedh|dhai|ara)\b/gi, (w) => String(FRACTION_WORDS[w.toLowerCase()]));
+}
+
+// "dhai kilo atta" -> "2.5 kilo atta"
+```
+
+### Noise and confidence
+
+For the pressure-cooker problem: do not build an audio-processing pipeline first. Modern speech-to-text models are trained on noisy audio and usually handle it better than hand-tuned filters, which can strip out the speech you need. Two things help more:
+
+- **Use the confidence signal.** Many vendors return per-word or per-segment confidence scores. If the score is low, or the transcript is nearly empty, do not guess: reply "Sorry, I couldn't hear that clearly. Could you type it or send it again?". A clarifying question costs one message; a wrong order costs a refund.
+- **Keep the audio** (for a limited time, see below) so that support can listen when a customer disputes an order, and so the eval set can grow from real failures.
+
+## Storing audio
+
+WhatsApp gives you a media ID, and the download URL you get from it expires within minutes. So the first worker step downloads the audio right away and writes it to your own object storage, using the key layout from lesson 5: `shops/{shopId}/voice/{yyyy}/{mm}/{messageId}.ogg`.
+
+From there:
+
+- The bucket is private and encrypted at rest. Workers read audio with short-lived credentials; support staff hear it through signed URLs, and every access is logged.
+- A **lifecycle rule** deletes audio after 30 days. Lesson 16 explains why 30 and not forever.
+- The **transcript** is stored with the message row, so most debugging never needs the audio at all.
+
+## Two paths: async for customers, streaming for shopkeepers
+
+DukaanVoice actually has two voice paths with different needs.
+
+**Customer voice notes** are the async path you have seen: queue, worker, budget, whole messages.
+
+**Shopkeeper voice questions** are different. Ravi holds a button in the app and asks "aaj kitna becha?" (how much did I sell today?). He is staring at the screen waiting, so every second shows. This path is **synchronous and streaming**: the app streams audio to the server while he speaks, a streaming recogniser transcribes as he talks, and the answer streams back into the app as it is generated.
+
+<Diagram
+  fig="9.2"
+  caption="The shopkeeper's voice question uses a streaming, synchronous path, because a person is watching the screen."
+  label="Sequence: the shopkeeper app streams audio to the API while he speaks; the API forwards it to a streaming speech-to-text service and receives partial transcripts. When he releases the button, the API sends the final question to the LLM with tools to query sales, and streams the answer back to the app as tokens arrive."
+  chart={`sequenceDiagram
+  participant App as Shopkeeper app
+  participant API
+  participant STT as Streaming STT
+  participant LLM as LLM via gateway
+  App->>API: audio chunks while button held
+  API->>STT: forward chunks
+  STT-->>API: partial transcripts
+  API-->>App: show words as they are recognised
+  App->>API: button released
+  API->>LLM: question plus sales tools
+  LLM-->>API: answer tokens
+  API-->>App: stream answer (SSE)
+`}
+/>
+
+The same building blocks (speech-to-text, the LLM wrapper, the catalog) serve both paths. The choices around them differ, because the users' situations differ. Lesson 19 covers how the streamed answer gets into the app.
+
+<Decision id="voice-sync-async" />
+
+## The reply: text or voice?
+
+Should DukaanVoice answer a voice note with a voice note? It is tempting: it feels more personal, and some customers are more comfortable listening than reading. But the reply contains an order summary with items, quantities and a total that the customer must **check** before paying. Reading a five-line list is faster and more reliable than listening to it, and a text message can be scrolled back to later. Text-to-speech (TTS) also costs money and adds latency.
+
+So the default is a text summary built from a template, with an optional voice reply that each shop can turn on for conversational messages like "your order is packed and on the way".
+
+<Decision id="reply-voice-or-text" />
+
+## When a stage fails
+
+Each stage needs a plan for failure, decided in advance:
+
+- **Media download fails:** retry with backoff (lesson 7). The media URL can be re-fetched from the media ID.
+- **Speech-to-text times out or errors:** retry once, then switch to a second speech-to-text provider. If both fail, ask the customer to type. Lesson 18 turns this into a system-wide degraded mode for Diwali night.
+- **Extraction fails validation:** one repair attempt, then escalate to a larger model or ask a clarifying question (lesson 11).
+- **WhatsApp send fails:** retry; the outbox from lesson 7 guarantees it is eventually attempted.
+
+## What the architecture looks like now
+
+The voice worker is now an instrumented pipeline with seven timed stages, each with a p95 budget and a fallback. Audio is copied to private storage straight away and deleted after 30 days. Speech-to-text gets language and brand hints, quantities are normalised by rules, and low-confidence transcripts trigger a clarifying question instead of a guess. Customers get text summaries in about 3 seconds at the median. A second, streaming path serves shopkeepers' spoken questions.
+
+Every model call still goes straight from the workers to one provider, each with its own retry logic. The next lesson pulls all of that into one place.
+
+## Interview angle
+
+<Interview
+  ask="Design the voice ordering flow. How do you keep it fast and accurate?"
+  mistake="Treating speech-to-text and the LLM as one black box with a single “AI latency” number. Interviewers want stage-by-stage budgets and a clear plan for each failure."
+>
+
+- You break the pipeline into stages and give each a latency budget that sums to an end-to-end target.
+- You explain why a cascaded pipeline fits asynchronous voice notes (inspectable, swappable, cheaper), and when speech-to-speech is better (live calls).
+- You know where streaming helps (a person watching the output) and where it does not (whole messages, validated JSON).
+- You handle code-mixing with tested models, recognition hints, script normalisation and deterministic quantity rules.
+- You use confidence scores to ask rather than guess, and you describe the fallback for each stage.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Split the voice path into stages, instrument each one, and give each a p95 budget under the end-to-end target.
+- A cascaded pipeline (speech-to-text, then understanding, then reply) is easier to debug, evaluate and swap than an end-to-end audio model, and fits asynchronous voice notes.
+- Code-mixed speech needs models tested on your own audio, recognition hints, one script for matching, and deterministic rules for quantities.
+- Use confidence: ask a clarifying question instead of guessing. Plan a fallback for every stage.
+- Stream only where a person watches the output, like the shopkeeper's voice questions.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Why does streaming LLM output not reduce latency for the customer's WhatsApp order summary?",
+      options: [
+        "WhatsApp's API does not allow messages longer than 100 characters",
+        "Streaming only works with speech-to-speech models",
+        "WhatsApp delivers whole messages, and the extraction JSON must be validated before anything is sent",
+        "Streaming increases the number of output tokens",
+      ],
+      answer: "C",
+      why: "Streaming helps when a person watches tokens arrive. Here nothing can be shown until the JSON is complete and validated, and the channel only sends whole messages. Streaming works with ordinary text models and does not change the token count.",
+    },
+    {
+      q: "Customers who say “dhai kilo atta” keep receiving orders for 2 kg. What is the most reliable fix?",
+      options: [
+        "Switch to a larger LLM for every order",
+        "Add a sentence to the prompt asking the model to be careful with Hindi numbers",
+        "Raise the speech-to-text confidence threshold",
+        "Normalise quantity words with a deterministic, unit-tested lookup table before extraction",
+      ],
+      answer: "D",
+      why: "Quantity words are a small closed set, so a lookup table converts them correctly every time and can be tested. A bigger model or a prompt tweak reduces the error rate without eliminating it. The transcript was right, so the speech-to-text threshold is not the issue.",
+    },
+    {
+      q: "When is a speech-to-speech model a better fit than DukaanVoice's cascaded pipeline?",
+      options: [
+        "For a live phone conversation, where low turn-taking latency and natural speech matter most",
+        "For asynchronous voice notes, because it removes the transcript",
+        "Whenever you need to audit and evaluate exactly where errors came from",
+        "Whenever cost per order must be as low as possible",
+      ],
+      answer: "A",
+      why: "Speech-to-speech shines in real-time conversation. For voice notes, the transcript in the middle is an advantage: it makes errors auditable and evaluable. Cascades are also typically cheaper and easier to cost-optimise stage by stage.",
+    },
+  ]}
+/>

@@ -1,3 +1,235 @@
 ## The problem
 
-Coming soon.
+The finance lead's monthly report has a red line in it. At 10,000 shops and about 300,000 orders a day, DukaanVoice's **AI cost per order** has crept up to **₹0.28**. The budget, set in lesson 2, is ₹0.25, which is 20% of the roughly ₹1.25 of revenue each order brings in. Nothing broke. Features were added (the analytics assistant, voice replies for some shops, a nightly catalog clean-up), each with a reasonable cost, and together they pushed the total over the line.
+
+At 50,000 shops, a ₹0.03 overspend per order is about ₹18 lakh a month. The company's next funding round depends on showing that unit economics get better with scale, not worse.
+
+This lesson is about cost as an engineering discipline: measure it per unit of value, find where it goes, and cut it in the order that costs you the least quality.
+
+## Unit economics
+
+**Unit economics** means looking at revenue and cost per unit of what you sell. For DukaanVoice, the natural unit is an **order**. It is what shops value, what drives most AI calls, and what scales with the business.
+
+| Per order (illustrative) | Amount |
+| --- | --- |
+| Revenue: ₹1,499 a month ÷ about 1,200 orders | ₹1.25 |
+| AI: speech-to-text, LLM calls, embeddings | ₹0.28 |
+| WhatsApp messaging fees (depends on Meta's current pricing and message categories) | varies |
+| Payment gateway fees for payment links (depends on gateway and plan) | varies |
+| Servers, database, storage, observability | about ₹0.06 |
+| **Contribution before salaries and support** | what is left |
+
+Two things to notice. First, AI is the largest controllable cost per order, which is why it gets a budget of its own. Second, some costs are not per order at all: the analytics assistant is used per **question**, by shopkeepers. Spreading it across orders is fine for a budget, but when you optimise it, measure it per question. Always pick the unit that matches what drives the cost.
+
+## Measure before you cut
+
+Because every model call goes through the gateway with a usage record (lesson 10), the breakdown takes one query:
+
+```sql title="reports/ai-cost-per-order.sql"
+SELECT task,
+       round(sum(cost_paise) / 100.0 / (SELECT count(*) FROM orders WHERE created_at >= now() - interval '7 days'), 3)
+         AS rupees_per_order
+FROM llm_usage
+WHERE created_at >= now() - interval '7 days'
+GROUP BY task
+ORDER BY rupees_per_order DESC;
+```
+
+<Diagram
+  fig="17.1"
+  caption="Where ₹0.28 per order goes, before optimisation. Speech-to-text is the largest single item; the analytics agent is the fastest growing."
+  label="Pie chart of AI cost per order: speech-to-text about 10 paise, analytics agent about 8 paise, item extraction about 5 paise, escalations to the large model about 3.6 paise, and other costs such as retries, embeddings and nightly jobs about 1 paisa."
+  chart={`pie showData
+  title AI cost per order, in paise
+  "Speech-to-text" : 10
+  "Analytics agent" : 8
+  "Item extraction" : 5
+  "Escalations" : 3.6
+  "Retries, embeddings, nightly" : 1
+`}
+/>
+
+The analytics line comes from about 40,000 shopkeeper questions a day at an average of ₹0.60 each, spread over 300,000 orders. With the breakdown in hand, the team works down the list in order of **savings per unit of quality risk**, not in order of how interesting the fix is.
+
+## The cheapest call is the one you never make
+
+Before tuning any prompt, ask which model calls do not need to exist.
+
+**The analytics agent** turned out to be answering the same few questions again and again. Over half of all questions were variations of "how much did I sell today?", "what sold most this week?" and "what is running low?". Those do not need an agent loop. The team added a **router** in front of the agent: a cheap intent classification (or, for the most common phrasings, a plain keyword match) sends known questions to **precomputed answers**. A nightly job, and a small incremental update after each order, keeps per-shop daily summaries ready. The full agent from lesson 13 only runs for open-ended questions.
+
+The average cost per question falls from ₹0.60 to about ₹0.26, and common answers arrive instantly instead of after 4 seconds. Users experience it as a speed improvement.
+
+**The order summary** was already a template (lesson 11). Every remaining model-generated message is checked the same way: if a template with a few variables can say it, a template says it.
+
+## Token budgets
+
+Next, make each necessary call smaller. Lesson 14 gave every section of the context a budget; now those budgets are revisited with data:
+
+- **Instructions:** the extraction instructions had grown to 900 tokens over sixteen versions, with several rules that the evals showed made no difference. Removing rules one at a time and re-running the eval suite brought them to 520 tokens with no slice regressing.
+- **Examples:** few-shot examples are powerful and expensive. Three carefully chosen examples did as well as eight.
+- **Catalog candidates:** sending the top 5 reranked candidates instead of 10 cut 300 tokens, with no measurable accuracy loss thanks to the reranker from lesson 12.
+- **Output:** the schema already prevents explanations. Shortening field descriptions trimmed output slightly. Do not go further and rename fields to cryptic one-letter keys: it saves a few tokens and tends to hurt accuracy and debuggability.
+
+Extraction input drops from about 2,500 to about 1,800 tokens per order. Every one of these changes went through the eval gate from lesson 15 with **cost as a gated metric**, so a future prompt that adds tokens without adding accuracy fails review automatically.
+
+## Caching, revisited
+
+Lesson 10 introduced three kinds of caching; here is what each is worth in practice:
+
+- **Provider prompt caching.** The stable prefix (instructions, tool definitions, shop context) is now about 1,300 of the 1,800 input tokens. On providers that discount cached input, and during busy hours when the same shop's prefix is reused within the cache window, a large share of input tokens are billed at the cached rate. The discount and the rules differ by vendor, so measure the actual cached-token counts that come back in the usage data rather than assuming.
+- **Exact caching.** Intent classification of very short messages ("ok", "haan", "1", "thank you") hits the cache constantly. Better still, the most common ones skip the model entirely with a lookup table.
+- **Semantic caching** stays limited to shop FAQs, for the safety reasons in lesson 10.
+
+## Batching
+
+Work that does not need an answer in seconds should not pay interactive prices. Many providers offer a **batch** interface: you submit a file of requests and get results within hours, usually at a substantial discount (often around half price; check your vendor). DukaanVoice moves the nightly catalog clean-up, product search-text generation, weekly insight summaries for shopkeepers, and the full nightly eval run to batch. These jobs also stop competing with customer orders for rate limits.
+
+## Cascades and routing, tuned
+
+The cascade from lesson 10 escalated about 8% of extractions to the large model. With better retrieval and the quantity rules from lesson 9, many escalations were no longer necessary: the small model's output had been failing grounding because search was missing the product, not because the small model misunderstood. After those fixes, and after recalibrating the escalation threshold on the eval set, escalations fall to about 5.5%.
+
+This is a pattern worth remembering. Cost problems in AI systems are often quality problems somewhere upstream. Improve retrieval and the expensive fallback is needed less.
+
+## Speech-to-text: the biggest line
+
+Speech-to-text is billed per second of audio, and it is the largest item. Three levers:
+
+1. **Trim silence.** A **voice activity detector** (VAD) is a small, cheap model that finds where speech is. Voice notes recorded at a busy counter often contain a second or two of silence or background noise at the start and end, plus pauses. Trimming before transcription cut billed audio by about 25% with no change in word error rate on the eval set. Check how your vendor bills (some round up per request, some have minimums) to know what trimming really saves.
+2. **Negotiate.** At hundreds of thousands of audio minutes a day, list prices are a starting point. Volume commitments usually bring discounts.
+3. **Consider self-hosting.** Strong open speech recognition models exist, including models tuned for Indian languages. This is where the self-hosting question gets serious, so it gets its own section.
+
+## Self-hosting: the break-even
+
+Running an open model on your own GPUs turns a **variable** cost (pay per second or per token) into a mostly **fixed** cost (GPU hours, whether busy or idle, plus the people who run them). It wins only when your volume is high **and** steady enough to keep the GPUs busy.
+
+Here is the reasoning with illustrative numbers for speech-to-text at the year-two target of 50,000 shops. Treat every number as a placeholder for your own quotes and benchmarks:
+
+- **API cost:** 3 million voice notes a day × 8 s = 400,000 audio minutes a day. At $0.006 a minute that is $2,400 a day, about **₹61 lakh a month**.
+- **Self-hosted throughput:** assume one cloud GPU, with batching, transcribes about 100 times faster than real time: 6,000 audio minutes per GPU-hour.
+- **GPUs needed:** 400,000 ÷ 6,000 ≈ 67 GPU-hours a day, an average of about 3 GPUs. But orders cluster in the evening at about 3x average, and Diwali is 10x, so you provision for peaks with autoscaling, and average utilisation ends up around 40%. Call it about 7 GPUs around the clock: 7 × 24 × 30 ≈ 5,000 GPU-hours a month.
+- **Self-hosted cost:** at an illustrative ₹200 per GPU-hour, about ₹10 lakh a month, plus roughly ₹6 lakh a month of engineering time for two people who also own reliability, and storage and monitoring on top. Call it about **₹17 lakh a month**.
+
+At 50,000 shops, self-hosting speech-to-text could save over ₹40 lakh a month. Now repeat the calculation at 2,000 shops: the API would cost about ₹2.4 lakh a month, while the self-hosted version still needs at least two GPUs for redundancy (about ₹2.9 lakh) and the same two engineers. The API wins easily.
+
+```ts title="finance/break-even.ts"
+// Volume (units per month) above which self-hosting is cheaper than the API.
+export function breakEvenUnits(p: { apiPerUnit: number; selfHostPerUnit: number; selfHostFixedPerMonth: number }) {
+  const savingPerUnit = p.apiPerUnit - p.selfHostPerUnit;
+  return savingPerUnit > 0 ? p.selfHostFixedPerMonth / savingPerUnit : Infinity;
+}
+
+// Audio minutes, in rupees (illustrative). Autoscaled GPU time is treated as per-minute (≈ ₹0.09);
+// people, redundancy and tooling are fixed (≈ ₹8 lakh a month).
+// breakEvenUnits({ apiPerUnit: 0.51, selfHostPerUnit: 0.09, selfHostFixedPerMonth: 800_000 })
+//   ≈ 1.9M audio minutes/month ≈ 63,000 a day: roughly 8,000 shops at today's usage.
+```
+
+The formula is simple; the inputs are where honesty matters. Things that are easy to leave out:
+
+- **Quality.** The open model must pass the same speech-to-text eval, per language slice, before any of this counts.
+- **Peaks.** You pay for the capacity you need on Diwali night, or you build overflow to the API for peaks (a hybrid that often works best).
+- **People and reliability.** On-call, upgrades, GPU shortages, driver issues. A team of five should be careful about adding this.
+- **Opportunity cost.** The engineers running GPUs are not building the product.
+
+<Decision id="self-host-vs-api" />
+
+## Smaller and fine-tuned models
+
+The same logic applies to the LLM. **Fine-tuning** means further training a model on your own labelled examples so that it does one task well. A small model fine-tuned on a few thousand of DukaanVoice's labelled orders can often match a much larger general model on that **narrow** task, at a fraction of the cost per call, and with shorter prompts, because the behaviour is learned rather than described in instructions.
+
+The costs are real: you need clean labelled data (the golden set from lesson 15 is a head start), a training and evaluation pipeline, and a plan for retraining when inputs drift. Fine-tuning also does not add knowledge that changes daily; prices and catalogs still come from retrieval.
+
+Item extraction is the obvious candidate: narrow, stable, extremely high volume, and already labelled by thousands of confirmed orders. Everything else (FAQ answers, analytics, clarifying questions) changes too often or is too varied to freeze into weights yet.
+
+<Decision id="finetune-vs-prompt" />
+
+## Budgets as guardrails
+
+Finally, make cost visible and bounded, so the next creep is caught in a week, not a quarter:
+
+- **Cost per order on the main dashboard**, broken down by task, next to latency and correction rate.
+- **Cost as a CI gate** (lesson 15): a change that raises tokens per order by more than 5% needs explicit approval.
+- **Per-shop monthly budgets** tied to the plan (lesson 10), with alerts and graceful degradation, never broken orders.
+- **Anomaly alerts** when any task's hourly cost exceeds a multiple of its usual value, which also catches the abuse from lesson 16.
+
+## The result
+
+After the changes in this lesson, AI cost per order is:
+
+| Item | Before | After | What changed |
+| --- | --- | --- | --- |
+| Speech-to-text | ₹0.100 | ₹0.075 | Silence trimming |
+| Analytics agent | ₹0.080 | ₹0.035 | Router and precomputed answers |
+| Item extraction | ₹0.050 | ₹0.030 | Prompt diet, fewer candidates, prompt caching |
+| Escalations | ₹0.036 | ₹0.025 | Better retrieval, recalibrated threshold |
+| Retries, embeddings, nightly | ₹0.010 | ₹0.007 | Batch API |
+| **Total** | **₹0.28** | **about ₹0.17** | |
+
+That is back under budget with room for new features, without any slice of the eval set getting worse. The self-hosted speech-to-text and the fine-tuned extractor are on the roadmap with a clear trigger: when the break-even math holds at real volume and the open models pass the evals.
+
+## Interview angle
+
+<Interview
+  ask="Your AI feature is too expensive. How do you bring the cost down?"
+  mistake="Jumping to “switch to a cheaper model” or “self-host” without measuring where the cost goes, or ignoring the effect on quality."
+>
+
+- Define the unit (per order, per question) and compare cost to revenue per unit.
+- Break cost down by task from usage logs before changing anything.
+- Remove calls first (routing, precomputation, templates), then shrink them (token budgets), then make them cheaper (caching, batching, cascades).
+- Use break-even reasoning for self-hosting, including utilisation, peaks, people and quality.
+- Protect quality with evals that gate on accuracy and cost together.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Measure AI cost per unit of value (per order, per question) and compare it with revenue per unit.
+- Find where the money goes with per-task usage records before optimising.
+- The order of attack: remove calls, then shrink them, then cache and batch them, then route them to cheaper models.
+- Self-hosting turns variable cost into fixed cost; it wins only at high, steady utilisation and only if quality holds on your evals.
+- Fine-tune small models for narrow, stable, high-volume tasks; keep cost as a gated metric so savings stick.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Half of the analytics agent's questions are “how much did I sell today?”. What is the most effective cost fix?",
+      options: [
+        "Switch the agent to a smaller model for every question",
+        "Reduce the agent's step limit from 8 to 3",
+        "Route common questions to precomputed per-shop summaries and run the agent only for open-ended questions",
+        "Add a semantic cache shared across all shops for analytics answers",
+      ],
+      answer: "C",
+      why: "The cheapest model call is the one you never make. Precomputed answers are instant and nearly free. A smaller model may hurt hard questions, a tight step limit cuts off legitimate analysis, and a cross-shop cache would leak one shop's sales to another.",
+    },
+    {
+      q: "Self-hosting speech-to-text saves money at 50,000 shops but not at 2,000. Why?",
+      options: [
+        "Self-hosting has large fixed costs (GPUs provisioned for peaks, engineers) that only pay off when volume is high enough",
+        "Open-source models only work above a minimum number of requests",
+        "API providers charge more per minute to large customers",
+        "GPUs are cheaper to rent in large quantities, so small deployments cannot get GPUs at all",
+      ],
+      answer: "A",
+      why: "Break-even = fixed costs ÷ saving per unit. At low volume, the fixed cost of GPUs and people outweighs the per-minute savings. Models do not need minimum traffic, and API volume pricing usually gets cheaper, not more expensive.",
+    },
+    {
+      q: "After better retrieval, the cascade escalates fewer extractions to the large model. What general lesson does this illustrate?",
+      options: [
+        "Large models should never be used in production",
+        "Escalation thresholds should be raised until no requests escalate",
+        "Retrieval quality only affects latency, not cost",
+        "Cost problems are often quality problems upstream; fixing an earlier stage can remove expensive fallbacks",
+      ],
+      answer: "D",
+      why: "Many escalations were caused by search missing the product, which made the small model's output fail grounding. Fixing retrieval reduced escalations without hurting accuracy. Large models still have a role, and pushing thresholds to zero escalations would hurt quality.",
+    },
+  ]}
+/>

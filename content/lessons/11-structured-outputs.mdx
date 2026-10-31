@@ -1,3 +1,261 @@
 ## The problem
 
-Coming soon.
+The team pulls every extraction failure from the past month, and the list is uncomfortable reading:
+
+- `"quantity": "two"`, a string where code expected a number, which crashed the order builder.
+- `"unit": "kilo"` in some responses and `"kg"` in others, so stock checks compared the wrong units.
+- A confident extraction of "Aashirvaad Select Atta 10 kg", a real product that this shop **does not sell**. The model had filled the gap from its general knowledge.
+- A response that began with "Sure! Here is the order:" before the JSON.
+- Worst: 0.4% of confirmed orders had a wrong item that nobody caught, and the customer had already paid.
+
+Each of these is the model behaving as models do. The fix is not a better prompt. It is a contract between the model and your code: a schema the output must satisfy, layers of validation, tools that look things up instead of guessing, and a human confirmation before any money moves.
+
+## From free text to a schema
+
+The first step is to stop asking for "the order as JSON" and start defining exactly what you want. In TypeScript, the natural tool is **Zod**, a schema library you may have used to validate request bodies. The same schema validates the model's output at runtime and gives you TypeScript types for free.
+
+```ts title="ai/schemas/extraction.ts"
+import { z } from "zod";
+
+export const ExtractedItem = z.object({
+  spokenText: z.string().describe("The exact words the customer used for this item, e.g. 'do kilo atta'"),
+  productQuery: z.string().describe("What to search the catalog for, e.g. 'atta'"),
+  brand: z.string().nullable().describe("Brand if the customer said one, else null"),
+  quantity: z.number().positive().max(100),
+  unit: z.enum(["kg", "g", "litre", "ml", "piece", "packet", "unknown"]),
+  confidence: z.number().min(0).max(1),
+});
+
+export const Extraction = z.object({
+  intent: z.enum(["new_order", "modify_order", "question", "complaint", "other"]),
+  items: z.array(ExtractedItem).max(30),
+  needsClarification: z.boolean(),
+  clarificationQuestion: z.string().nullable(),
+});
+
+export type Extraction = z.infer<typeof Extraction>;
+export const extractionJsonSchema = z.toJSONSchema(Extraction); // sent to the model
+```
+
+A few design choices make schemas work better with models, not just with code:
+
+- **Use enums for anything categorical.** `unit` is one of seven values, not free text. That one change fixes the "kilo" versus "kg" problem.
+- **Give the model an honest way out.** `"unknown"` units, a `needsClarification` flag and `other` intents mean the model does not have to force-fit something it is unsure about. Schemas without an escape hatch encourage confident nonsense.
+- **Ground fields in the input.** `spokenText` asks for the customer's actual words for each item. It makes outputs easier to check, and it discourages invented items, because there is nothing to quote.
+- **Describe fields.** The `.describe()` text ends up in the JSON Schema and works like documentation for the model.
+- **Ask for what the model is good at, and nothing else.** Notice there is no `price` or `total` field. Prices come from your database. Lesson 16 explains why this is a security rule as well as a correctness one.
+
+## Making the model follow the schema
+
+Providers offer three levels of help, and they are easy to confuse:
+
+1. **Prompt-only.** You describe the format in the instructions and hope. Works most of the time, fails in all the ways from the list above.
+2. **JSON mode.** The provider guarantees the output is valid JSON, but not that it matches your schema. No "Sure! Here is...", but `"quantity": "two"` is still possible.
+3. **Structured outputs with a schema.** You pass a JSON Schema and the provider constrains generation so the output conforms to it. With this, malformed and off-schema outputs become rare or impossible for the schema features the provider supports. Support for keywords like `max`, formats and unions varies by vendor, so check the documentation.
+
+Use the strongest level your provider supports. But even a perfectly schema-valid output can be **wrong**. `{"quantity": 2, "unit": "kg", "productQuery": "atta"}` is valid whether the customer said two kilos or five. A schema guarantees shape, not truth. That is why validation has more than one layer.
+
+## Validation in layers
+
+Every extraction passes through four checks, from cheapest to most expensive:
+
+<Diagram
+  fig="11.1"
+  caption="Four layers of validation. Each catches failures the previous one cannot."
+  label="Validation layers: the model output is first parsed as JSON, then validated against the Zod schema, then checked against business rules such as quantity limits and unit compatibility, then grounded by matching each item to a real product in this shop's catalog. A failure at any layer leads to one repair attempt, then escalation or a clarifying question."
+  chart={`flowchart TD
+  O["Model output"] --> P{"1. Parses as JSON?"}
+  P -->|"yes"| S{"2. Matches the Zod schema?"}
+  S -->|"yes"| B{"3. Passes business rules?"}
+  B -->|"yes"| G{"4. Every item matches this shop's catalog?"}
+  G -->|"yes"| OK["Draft order"]
+  P -->|"no"| R["Repair once"]
+  S -->|"no"| R
+  B -->|"no"| R
+  G -->|"no"| CL["Escalate or ask the customer"]
+  R -->|"still failing"| CL
+`}
+/>
+
+1. **Syntax.** Does it parse? With structured outputs this almost never fails, but check anyway.
+2. **Schema.** `Extraction.safeParse(json)`. Types, enums, ranges.
+3. **Business rules.** Rules the schema cannot express, or that need data: no more than 20 kg of any staple in one order without confirmation; `litre` is not a valid unit for atta; a `modify_order` intent needs an open order to modify.
+4. **Grounding.** Every item must match a real, active product **in this shop's catalog**, found through search (lesson 12). This layer is what catches the "Aashirvaad Select 10 kg" hallucination: it simply does not exist in this shop.
+
+### The repair loop
+
+When layers 1 to 3 fail, one cheap and effective trick is to give the model its own error and ask it to fix the output:
+
+```ts title="ai/extract.ts"
+export async function extractItems(ctx: Ctx, transcript: string): Promise<Extraction | null> {
+  let messages = buildExtractionPrompt(ctx, transcript);
+
+  for (let attempt = 0; attempt < 2; attempt++) {           // original + one repair, never more
+    const res = await gateway.complete({ task: "extract_items", shopId: ctx.shopId, messages, schema: extractionJsonSchema });
+    const parsed = Extraction.safeParse(safeJson(res.text));
+    const problems = parsed.success ? businessRuleErrors(parsed.data, ctx) : formatZodIssues(parsed.error);
+    if (parsed.success && problems.length === 0) return parsed.data;
+
+    messages = [...messages,
+      { role: "assistant", content: res.text },
+      { role: "user", content: `Your output had these problems:\n- ${problems.join("\n- ")}\nReturn corrected JSON only.` }];
+  }
+  return null; // caller escalates to the large model or asks a clarifying question
+}
+```
+
+Cap repairs at one. If a model cannot fix its output after seeing the exact error, a third attempt rarely helps, and each attempt adds latency and cost. Hand off to the cascade from lesson 10 instead.
+
+## Tool calling
+
+Extraction answers "what did the customer ask for?". It does not answer "which product in this shop is that?" or "is it in stock?". The model does not know Ravi's catalog. It could only guess, and the guess is exactly the hallucination you are trying to remove.
+
+**Tool calling** (also called function calling) lets the model ask your code for information. You describe a set of tools, each with a name, a description and a JSON Schema for its arguments. Instead of a final answer, the model can respond with a request to call a tool with specific arguments. Your code runs the tool, sends the result back, and the model continues. The model never executes anything itself; it only proposes calls, and your code decides whether to run them.
+
+<Diagram
+  fig="11.2"
+  caption="A tool-calling loop. The model proposes calls; the worker validates and runs them with the shop ID it already trusts."
+  label="Sequence: the worker sends the transcript and tool definitions to the model. The model asks to call searchCatalog for atta; the worker runs it scoped to the current shop and returns three candidates. The model asks to call checkStock for one product; the worker returns the stock. The model returns its proposed draft order. The worker validates it, computes prices from the database and creates a draft order."
+  chart={`sequenceDiagram
+  participant W as Worker
+  participant M as Model (via gateway)
+  participant DB as Catalog and stock
+  W->>M: transcript plus tool definitions
+  M-->>W: call searchCatalog("atta", brand "Aashirvaad")
+  W->>DB: search, scoped to shop_id from the job
+  DB-->>W: 3 candidates
+  W->>M: tool result
+  M-->>W: call checkStock(["p_81"])
+  W->>DB: stock for p_81 in this shop
+  DB-->>W: 14 in stock
+  W->>M: tool result
+  M-->>W: proposed items with product ids and quantities
+  W->>W: validate, price from DB, create draft order
+`}
+/>
+
+DukaanVoice gives the model three tools for orders:
+
+- `searchCatalog(query, brand?)` returns the top few matching products with IDs, names, pack sizes and match scores.
+- `checkStock(productIds)` returns availability.
+- `proposeDraftOrder(items)` submits the model's proposal: product IDs and quantities, nothing else.
+
+### Rules for tools
+
+How you design and execute tools matters more than the prompt. These rules come from incidents, not theory:
+
+- **The model never supplies identity or tenancy.** None of the tools take a `shopId` argument. The worker already knows the shop from the verified webhook and injects it when running every tool. If the model could pass `shopId`, a prompt injection ("search shop 2's catalog") could cross tenants. Lesson 16 returns to this.
+- **Validate tool arguments like any untrusted input.** Parse them with Zod before running anything. A tool call is a request from an untrusted source that happens to be your own model.
+- **No tool moves money.** There is no `createPayment` or `confirmOrder` tool. `proposeDraftOrder` creates a draft that a deterministic code path prices and sends to the customer for confirmation.
+- **Keep the tool set small and descriptions sharp.** A handful of well-named tools beats twenty overlapping ones. The description is a prompt; say when to use the tool and when not to.
+- **Return compact results.** Three candidates with IDs and pack sizes, not a full product JSON with 40 fields. Tool results are input tokens on the next call.
+- **Return errors as data.** "No product matches 'surf exel'" is a useful tool result that lets the model try "Surf Excel". Throwing an exception ends the loop.
+- **Cap the loop.** A maximum of, say, four tool calls per order. If the model has not proposed an order by then, something is wrong; escalate or ask the customer.
+
+<Decision id="structured-vs-tools" />
+
+## Confidence and thresholds
+
+After validation, every draft has signals attached: the catalog match score for each item, the model's own confidence, whether the quantity is unusual for this customer, whether a substitute was involved. The question is what to do with them.
+
+DukaanVoice combines them into three routes:
+
+- **High confidence:** build the summary and ask the customer to confirm. This is about 90% of orders.
+- **Medium confidence:** ask a **targeted** clarifying question: "Do you want Aashirvaad 5 kg or 10 kg?" Two buttons, one tap.
+- **Low confidence:** hand over to the shopkeeper with the transcript and the audio link. Ravi can fix it in the app in ten seconds.
+
+Where do the cut-offs come from? Not from intuition. They are **calibrated** on the evaluation set (lesson 15): for each candidate threshold, measure what fraction of orders pass and how many of those were actually wrong. Then pick the trade-off you can live with, for example "at most 1 wrong order in 500 reaches the confirmation step". Self-reported model confidence on its own is poorly calibrated, which is why it is only one of several signals.
+
+## Humans in the loop before money moves
+
+The 0.4% of wrong orders that customers paid for all had one thing in common: the summary was sent with a payment link already attached, and customers paid without reading it closely.
+
+The fix is a **confirmation step** with a specific design:
+
+1. The summary is built by **code**, from the validated draft and prices from the database. The model does not write it, so it cannot misstate a price or total.
+2. It shows each item with brand, pack size, quantity and line price, plus the total.
+3. The customer must reply "1" (or tap a button) to confirm. Only then is stock reserved (lesson 4) and the payment link created with an idempotency key (lesson 5).
+4. Substitutions ("the 5 kg is out; we have two 2 kg packs instead") always need explicit confirmation, even at high confidence.
+
+```text
+Sri Lakshmi Kirana: your order
+1. Aashirvaad Atta 5 kg × 1      ₹265
+2. Surf Excel Easy Wash 1 kg × 1 ₹140
+Total ₹405
+Reply 1 to confirm, 2 to change.
+```
+
+After this change, wrong-item orders that reach payment drop from 0.4% to about 0.03%, and most of those are caught by the shopkeeper while packing.
+
+<Decision id="auto-confirm" />
+
+## What the architecture looks like now
+
+Inside the voice worker, the "understand" stage has become a small, strict pipeline: structured extraction with a Zod schema, four layers of validation, one repair attempt, a short tool loop for catalog search and stock checks with the shop ID injected by the worker, confidence-based routing, and a code-built confirmation message before any stock is reserved or payment link created. The model proposes; code decides. That sentence is the core of production AI engineering, and you will see it again in every remaining lesson.
+
+## Interview angle
+
+<Interview
+  ask="The LLM sometimes returns invalid or wrong data. How do you make the pipeline reliable?"
+  mistake="Answering “improve the prompt” or “use JSON mode” as if valid JSON meant correct data. Interviewers want layered validation, grounding against real data and a human confirmation for consequential actions."
+>
+
+- Schemas with enums and escape hatches, enforced with structured output modes and validated again in code.
+- Layered checks: syntax, schema, business rules, grounding against the tenant's real data.
+- A bounded repair loop, then escalation or clarification.
+- Tool calling for lookups, with tenant identity injected server-side and no tool that moves money.
+- Calibrated confidence thresholds and a confirmation step before payment.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Define outputs with a schema (Zod in TypeScript), using enums, descriptions and honest escape hatches like `unknown` and `needsClarification`.
+- Structured output modes guarantee shape, not truth. Validate syntax, schema, business rules and grounding in that order.
+- Repair once by showing the model its errors; then escalate or ask the customer.
+- Tools let the model look things up instead of guessing. Inject tenant identity yourself, validate arguments, and never expose a tool that moves money.
+- Calibrate confidence thresholds on data, and require explicit confirmation of a code-built summary before payment.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "The provider's structured output mode guarantees responses match your JSON Schema. What does that still not protect against?",
+      options: [
+        "Responses that start with “Sure! Here is the order:”",
+        "Quantities returned as strings instead of numbers",
+        "Missing required fields",
+        "A schema-valid quantity or product that does not match what the customer actually said",
+      ],
+      answer: "D",
+      why: "Constrained generation fixes format problems: chatty prefixes, wrong types, missing fields. It cannot make the content true. That is what business rules, grounding against the catalog and customer confirmation are for.",
+    },
+    {
+      q: "Why does the `searchCatalog` tool not accept a `shopId` argument from the model?",
+      options: [
+        "Tool schemas cannot contain ID fields",
+        "It would add too many input tokens to the tool definition",
+        "The worker already knows the shop from the verified webhook; letting the model choose it would let a prompt injection reach another tenant's data",
+        "The catalog search is global, so shop ID is not needed",
+      ],
+      answer: "C",
+      why: "Tenant identity comes from authenticated context, never from model output, because model output can be steered by the customer's message. Tool schemas can contain IDs, the token cost is trivial, and the search is very much per shop.",
+    },
+    {
+      q: "An extraction fails schema validation. What is the recommended next step?",
+      options: [
+        "Send the validation errors back to the model for one repair attempt, then escalate or ask the customer if it still fails",
+        "Retry the identical request up to five times until it passes",
+        "Accept the output and fix the types in code with best guesses",
+        "Fail the order silently and wait for the customer to resend",
+      ],
+      answer: "A",
+      why: "Showing the model its specific errors fixes many failures in one cheap step. Blind retries repeat the same mistake and cost more, guessing types in code reintroduces the bugs validation exists to stop, and silent failure is the worst customer experience.",
+    },
+  ]}
+/>

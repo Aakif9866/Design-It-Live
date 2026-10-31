@@ -1,3 +1,235 @@
 ## The problem
 
-Coming soon.
+The queue from lesson 7 has made DukaanVoice robust to slow dependencies, so the team finally has time to look closely at the dependency at the centre of the product: the large language model.
+
+Anjali exports a week of LLM call logs, about 400,000 calls across 2,000 shops, and reads them like a doctor reads blood test results:
+
+- **Latency is all over the place.** The median call takes 1.8 seconds. The slowest 1% take over 14 seconds.
+- **0.7% of calls failed** with `429 Too Many Requests` or `5xx` errors, mostly between 7 and 9 pm.
+- **The same input does not always give the same output.** One test message, sent ten times, produced "2 kg atta" nine times and "2 packets atta" once.
+- **Some JSON was cut off mid-object** because the response hit the output token limit.
+- **Costs rose 30% in one week** without any change in traffic. Someone had added three examples to the prompt.
+- An email from the provider announced that the model version they use will be retired in six months.
+
+None of this is a bug in the model. It is what models are like. This lesson is about building systems that expect it.
+
+## The mental model: an unusual dependency
+
+You already know how to depend on an external service. You have called payment gateways and third-party APIs and learned not to trust them blindly. An LLM is an external dependency too, with four unusual properties at once:
+
+| Property | A Postgres query | An LLM call |
+| --- | --- | --- |
+| Latency | milliseconds, predictable | seconds, long tail |
+| Cost | effectively free per call | priced per token, adds up fast |
+| Reliability | fails rarely and loudly | rate limits, overloads, truncations, quiet wrong answers |
+| Determinism | same input, same output | same input, sometimes different output |
+
+The last row is the one that changes how you engineer. A database that returns the wrong row is a bug you fix once. A model that returns the wrong quantity 1% of the time is a **property of the component**. You cannot fix it; you design around it, with validation, confirmation and measurement. The rest of Part B is mostly about those three things.
+
+## Tokens
+
+Models read and write **tokens**, not characters or words. A tokenizer splits text into pieces from a fixed vocabulary: common English words are often one token, rarer words split into several, and punctuation and spaces count too. As a rough guide, English averages about three-quarters of a word per token.
+
+Two things matter for DukaanVoice:
+
+- **Language changes the count.** Hindi in Devanagari or Telugu script typically uses noticeably more tokens per word than English with many tokenizers, though newer tokenizers have improved this. Romanised Hinglish ("bhaiya atta bhej do") is in Latin script but full of words the tokenizer has seen less often. Do not guess: run a sample of real messages through your provider's token counter and measure.
+- **Everything you send counts.** The system instructions, the catalog excerpt, the conversation history and the tool definitions are all input tokens, on every call. In DukaanVoice's 2,500 input tokens per order, the customer's actual words are maybe 30.
+
+That is why "someone added three examples to the prompt" raised costs by 30%. The prompt is sent with every request, so a prompt change is a cost change. Treat prompt edits like infrastructure changes.
+
+## Where the latency comes from
+
+An LLM call has three phases:
+
+1. **Queueing and network.** Your request travels to the provider and may wait for capacity, especially at peak hours.
+2. **Prefill.** The model processes all the input tokens. This is highly parallel on the GPU, so it is relatively fast per token, but long inputs still add up.
+3. **Decode.** The model generates output tokens **one at a time**, each depending on the previous ones. This is inherently sequential.
+
+From the client's side, two numbers describe this:
+
+- **Time to first token (TTFT):** how long until the first output token arrives. Queueing plus prefill.
+- **Output speed:** tokens generated per second during decode.
+
+A useful approximation:
+
+> total latency ≈ TTFT + output tokens ÷ output speed
+
+With illustrative numbers (TTFT of 0.4 s and 80 tokens per second), a 300-token answer takes about 0.4 + 300 ÷ 80 ≈ **4.2 seconds**. A 60-token answer takes about **1.2 seconds**. Shortening the output is usually the single biggest latency lever you control. Ask for compact JSON, not an essay. Do not ask the model to repeat the input back.
+
+Some models also do **reasoning**: they generate internal "thinking" tokens before the visible answer. Those tokens take decode time and are usually billed as output, even if you never see them. How they are exposed and priced varies by vendor. They can make hard tasks much more accurate and easy tasks much slower and more expensive, so use them where accuracy pays for it.
+
+<Diagram
+  fig="8.1"
+  caption="Every LLM call goes through one wrapper that treats the model like the unreliable, slow, expensive dependency it is."
+  label="LLM call wrapper: the worker builds a prompt and calls the wrapper. The wrapper applies a timeout and sends the request to the provider. Errors such as 429 and 5xx are retried with backoff. A response cut off at the token limit is treated as a failure. Successful output is validated against a schema; invalid output is repaired or rejected. Every call logs tokens, latency, cost and model version."
+  chart={`flowchart TD
+  A["Worker builds prompt"] --> B["callModel wrapper"]
+  B --> C{"Within timeout?"}
+  C -->|"no"| R["Retry with backoff, or fall back"]
+  C -->|"yes"| D{"Status"}
+  D -->|"429 or 5xx"| R
+  D -->|"200"| E{"Finished normally?"}
+  E -->|"hit max tokens"| R
+  E -->|"yes"| F{"Valid against schema?"}
+  F -->|"no"| G["Repair once, else reject"]
+  F -->|"yes"| H["Use the result"]
+  B -.-> L[("Log: tokens, latency, cost, model, prompt version")]
+`}
+/>
+
+## Context windows
+
+The **context window** is the maximum number of tokens a model can handle in one call, input and output combined. Modern models offer windows from tens of thousands to over a million tokens, depending on the model and vendor.
+
+A big window is a capability, not an instruction. Filling it has costs:
+
+- **Money.** Input tokens are billed on every call. Sending a shop's entire 2,000-product catalog (perhaps 40,000 tokens) with every voice note would multiply DukaanVoice's per-order cost more than ten times.
+- **Latency.** Prefill time grows with input length.
+- **Quality.** Models tend to use information at the start and end of a long context more reliably than information buried in the middle, and irrelevant text distracts them. More context can make answers **worse**.
+
+The design goal is the smallest context that contains what the model needs. Lesson 12 (retrieval) and lesson 14 (context engineering) are about doing that well.
+
+## Pricing, and how to read a price page
+
+Provider pricing has a common structure, though the details change often and differ between vendors:
+
+- A price per million **input** tokens and a higher price per million **output** tokens.
+- Often a reduced price for **cached input**: if the start of your prompt is identical to a recent request, the provider may reuse its work and charge less. Lesson 10 designs prompts to take advantage of it.
+- Often a **batch** option: submit many requests to be processed within hours instead of seconds, usually at a large discount. Perfect for nightly jobs, useless for a customer waiting on WhatsApp.
+- Sometimes extra charges for features like built-in web search, or for long-context calls above a threshold.
+
+This course deliberately does not name specific models or current prices, because both change every few months. Use the illustrative numbers from lesson 2, and always check the current price page and do the token math before you commit.
+
+## Rate limits
+
+Providers protect their capacity with **rate limits**, typically on requests per minute (RPM) and tokens per minute (TPM), set per organisation and often per model. When you exceed them you get `429` responses, usually with a `Retry-After` header. Limits generally rise with your spending history, and you can often request increases.
+
+Lesson 2 estimated around 39 million tokens per minute at DukaanVoice's Diwali peak. Rate limits are therefore a **capacity planning** problem, not just an error to retry. The tools are: request limit increases well before festivals; spread load across more than one provider or region (lesson 10); limit your own concurrency so you degrade gracefully instead of drowning in 429s; and keep prompts short, because every token counts against TPM.
+
+## Nondeterminism
+
+LLMs generate text by sampling from a probability distribution over the next token. The **temperature** setting controls how adventurous that sampling is: higher means more varied, lower means more predictable. For extraction tasks like reading an order, use a low temperature.
+
+But even at temperature zero, **do not assume identical outputs**. Provider-side batching, hardware differences, floating-point effects and silent model updates can all change results slightly. The practical consequences:
+
+- **Validate every output** against a schema and business rules, every time. Lesson 11.
+- **Test with datasets, not single examples.** "It worked when I tried it" is meaningless for a component that is right 98% of the time. Lesson 15.
+- **Pin model versions** where the provider offers dated snapshots, and treat a version change like a dependency upgrade: run your evals first. That retirement email is a project, not a config change.
+
+## A wrapper for every call
+
+All of this comes together in one place in code. Every model call in DukaanVoice goes through a single function, never through the provider's SDK directly from business logic:
+
+```ts title="ai/call-model.ts"
+export async function callModel(req: ModelRequest): Promise<ModelResult> {
+  const started = performance.now();
+  const res = await withRetry(() =>
+    provider.generate({ ...req, signal: AbortSignal.timeout(req.timeoutMs ?? 8_000) }),
+  );
+
+  if (res.finishReason === "max_tokens") throw new TruncatedOutputError(req.task); // never parse half a JSON object
+
+  await recordUsage({
+    task: req.task,               // "extract_items", "write_summary", ...
+    shopId: req.shopId,
+    model: res.model,             // the exact version that answered
+    promptVersion: req.promptVersion,
+    inputTokens: res.usage.input,
+    outputTokens: res.usage.output,
+    latencyMs: performance.now() - started,
+    costPaise: priceOf(res),
+  });
+  return res;
+}
+```
+
+It looks almost too simple, but it gives you the timeout, retries with jitter (from lesson 7), truncation detection, and per-shop, per-task cost and latency records. Those records are what you will use to answer "why did costs rise 30% this week?" in about a minute. In lesson 10 this wrapper grows into a full gateway.
+
+## Picking a model by task
+
+There is no "best model". There is the cheapest model that meets the quality bar **for a specific task**, measured on your own data. DukaanVoice has several tasks with very different needs:
+
+| Task | What it needs | Model class |
+| --- | --- | --- |
+| Is this message an order, a question or a complaint? | Fast, cheap classification | Small |
+| Extract items and quantities from a transcript | Reliable structured extraction | Small, escalate when unsure |
+| Resolve a confusing or contradictory order | Reasoning over ambiguity | Large |
+| Write the confirmation message | Short, templated text | Small, or no model at all |
+| Answer "why did my sales drop last week?" | Multi-step reasoning, tool use | Large |
+
+Notice the "no model at all" entry. The order summary is mostly a template filled with validated data. Using a model to format a list you already have is paying for nondeterminism you do not want.
+
+<Decision id="model-size" />
+
+<Decision id="stream-vs-wait" />
+
+## What the architecture looks like now
+
+The diagram barely changes: the voice workers still call an LLM provider. But every call now goes through `callModel`, with timeouts, retries, truncation checks and usage logging. Tasks are split so that each one can use the smallest model that does it well. Model versions are pinned. The team knows its latency budget comes mostly from output tokens, and its cost from input tokens. The next lesson puts this to work on the most demanding path in the product: a voice note going in, an order summary coming out.
+
+## Interview angle
+
+<Interview
+  ask="Your product calls an LLM API on every request. What can go wrong, and how do you design for it?"
+  mistake="Treating the model as a function that returns the right answer. Interviewers listen for timeouts, retries, validation, cost tracking and the fact that outputs vary."
+>
+
+- You name the four properties: slow with a long tail, expensive per token, unreliable (rate limits, overloads, truncation), nondeterministic.
+- You break latency into TTFT and output speed, and note that output length is the main lever.
+- You talk about rate limits as capacity planning, including multiple providers.
+- You mention validating every output, pinning model versions and testing on datasets.
+- You choose models per task based on evaluation, not on hype.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Treat an LLM as a slow, expensive, unreliable and nondeterministic dependency, and wrap every call accordingly.
+- Latency ≈ time to first token + output tokens ÷ output speed. Shorter outputs are the biggest latency win.
+- Every token you send is billed on every call; prompt edits are cost changes. Measure token counts on real multilingual data.
+- Rate limits are a capacity-planning problem. Validate every output, pin model versions, and evaluate on datasets.
+- Choose the smallest model that meets the bar for each task; sometimes the right model is a template.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "A call has a time to first token of 0.4 s and an output speed of 80 tokens per second. Which change cuts total latency the most?",
+      options: [
+        "Reducing the output from 300 tokens to 60 by asking for compact JSON",
+        "Removing 200 tokens from a 2,500-token input prompt",
+        "Raising the temperature so the model answers more decisively",
+        "Requesting a bigger context window",
+      ],
+      answer: "A",
+      why: "Output tokens are generated one at a time, so cutting 240 of them saves about 3 seconds. Trimming input mainly shortens prefill, which is fast per token. Temperature changes randomness, not speed, and a bigger window adds nothing here.",
+    },
+    {
+      q: "You set temperature to 0 for item extraction. Which statement is correct?",
+      options: [
+        "Outputs are now guaranteed identical for identical inputs, so a single test is enough",
+        "Outputs become much more predictable, but you should still validate every result and test on datasets",
+        "Temperature 0 makes the model slower but more accurate",
+        "Temperature only affects creative writing, so it makes no difference for extraction",
+      ],
+      answer: "B",
+      why: "Low temperature reduces sampling randomness, but batching, hardware and silent model updates can still change outputs. It does not change speed or intrinsic accuracy, and it matters for extraction because it reduces variation.",
+    },
+    {
+      q: "Why not simply send the shop's entire 2,000-product catalog with every voice note, since the context window is large enough?",
+      options: [
+        "Large context windows are only available on batch APIs",
+        "Providers reject requests that use more than half the context window",
+        "It raises cost and latency on every call, and lots of irrelevant text can make the model's answers worse",
+        "The model would memorise the catalog and leak it to other shops",
+      ],
+      answer: "C",
+      why: "Input tokens are billed and processed on every call, and long, noisy contexts tend to reduce accuracy. The other options are not real constraints. Models do not learn from your API calls in a way that leaks across requests, though logs and caches can leak, which lesson 16 covers.",
+    },
+  ]}
+/>

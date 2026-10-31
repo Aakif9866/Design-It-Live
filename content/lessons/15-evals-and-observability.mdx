@@ -1,3 +1,243 @@
 ## The problem
 
-Coming soon.
+On a Tuesday, the team ships extraction prompt version 15. It adds better instructions for Telugu number words, and Anjali tested it carefully: twenty real Telugu voice notes, all correct, several better than before. It goes out to all 10,000 shops.
+
+On Thursday, shopkeepers in Nagpur and Indore (DukaanVoice expanded into Maharashtra and Madhya Pradesh last month) start complaining that quantities are wrong. "Dedh kilo" is coming out as 1 kg again. The customer **correction rate** (customers replying "2" to change the order) for Hindi-speaking shops has gone from 3.1% to 4.6%. Nobody noticed for two days, because the platform-wide number barely moved: Telugu shops improved by about the same amount that Hindi shops got worse.
+
+The prompt change was fine for the cases someone checked by hand. It broke cases nobody checked. With a nondeterministic component, "I tried it and it worked" tells you almost nothing. This lesson replaces it with measurement.
+
+## What an eval is
+
+An **eval** (evaluation) is a repeatable measurement of how well an AI component does its job, on a fixed set of inputs, scored the same way every time. Think of it as a test suite for a component that is right most of the time rather than always. Instead of "does this test pass?", you ask "what percentage of cases pass, and did that number go down?".
+
+Three things make up an eval:
+
+1. **A dataset** of inputs with known good outputs or criteria.
+2. **A scorer** that compares the system's output to the expectation.
+3. **A threshold or comparison**: is the score good enough, and is it at least as good as the current production version?
+
+## The golden dataset
+
+The heart of DukaanVoice's evals is a **golden dataset** of real voice orders, each labelled with the correct result. Building it well matters more than any scoring trick.
+
+**Where the examples come from:**
+
+- **Sampled production traffic**, with consent under the shop's and customer's terms. Real audio, real noise, real code-mixing. This is what synthetic data can never fully imitate.
+- **Every failure.** Each bug report, each wrong order a shopkeeper corrected, each dead-lettered message becomes a candidate test case. Over time the dataset becomes a museum of every way the system has failed, which is exactly what you want to test against.
+- **Targeted synthetic cases** for rare situations you need covered before they happen: festival items ("diya", "rangoli colours"), very long lists, unusual units. Useful, but label them and keep them a minority, because generated audio and text are cleaner than reality.
+
+**What a label contains:** the transcript (for speech-to-text evaluation), the expected items as product IDs with quantities and units, the expected intent, and whether a clarifying question was the right response. Confirmed orders give you weak labels for free (the customer confirmed what they meant), but a human checks each one before it goes in, because customers sometimes confirm wrong orders.
+
+**Slices.** Every example is tagged: language mix, region, shop type, audio length, noise level, number of items, and "hard case" flags. **Slices** are the most important idea in this lesson. The v15 regression was invisible in the aggregate and obvious in the Hindi slice.
+
+**Size.** Start with a couple of hundred examples covering the main slices; it is far better than none. DukaanVoice's set is now about 3,000 orders, with at least 150 in every slice the team cares about. Keep a **held-out** portion that nobody looks at while tuning prompts, so you notice when changes are overfitted to the examples you stare at every day.
+
+## Measure each stage separately
+
+A single "is the order right?" score tells you something is wrong but not where. DukaanVoice scores every stage of the pipeline separately:
+
+| Stage | Metric | Target |
+| --- | --- | --- |
+| Speech-to-text | Word error rate (WER) per language slice | below 12% |
+| Retrieval | Recall@5 after reranking (lesson 12) | above 97% |
+| Extraction | Item-level precision and recall; exact quantity match | above 98% |
+| Whole order | Exact order match: every item, quantity and unit correct | above 95% |
+| Behaviour | Correctly asks a clarifying question when it should | above 90% |
+| Operations | p95 latency and cost per order on the eval run | within budget |
+
+To keep runs fast and cheap, the extraction evals start from **stored transcripts**, so speech-to-text is not re-run for every prompt change. Speech-to-text has its own eval, run when that stage changes.
+
+## Programmatic checks versus an LLM as judge
+
+Most of DukaanVoice's outputs are **structured**: items, quantities, product IDs. Scoring them needs no intelligence, just code. Is product 81 in the output? Is the quantity 2.5? Programmatic checks are fast, free, deterministic and objective. Use them wherever the output has structure.
+
+Some outputs are **free text**: the wording of a clarifying question, the explanation in an analytics answer. There is no single correct string. For those, a common technique is **LLM-as-judge**: a model scores the output against a rubric.
+
+LLM judges are useful and have well-documented biases:
+
+- **Position bias.** When comparing two answers, judges often favour whichever comes first (or second). Run comparisons in both orders.
+- **Verbosity bias.** Longer answers tend to get higher scores even when they are not better.
+- **Self-preference.** A model may favour outputs that sound like its own.
+- **Inconsistency.** The same judge can score the same answer differently across runs.
+
+Make judges trustworthy by narrowing their job. Use **specific, mostly yes-or-no criteria** ("Does every number in the answer appear in a tool result?", "Is the question answerable with one tap?") rather than "rate this 1 to 10". **Calibrate** the judge against human labels on a sample (measure how often it agrees with people) before trusting it, and recheck after changing the judge prompt or model. And keep a human reviewing a weekly sample anyway.
+
+```ts title="evals/judges/analytics-grounding.ts"
+// A narrow judge: one yes-or-no question, with the evidence it needs.
+export const groundingJudge = {
+  id: "analytics_grounding",
+  version: 3,
+  prompt: (answer: string, toolResults: string) => `
+You are checking an analytics answer for a shopkeeper.
+Tool results (the only allowed source of numbers):
+${toolResults}
+
+Answer to check:
+${answer}
+
+Does every number in the answer appear in, or follow by simple arithmetic from, the tool results?
+Reply with JSON: {"grounded": true|false, "unsupported_numbers": string[]}`,
+};
+// Calibrated on 300 human-labelled answers: 94% agreement. Recheck on every judge change.
+```
+
+<Decision id="judge-vs-exact" />
+
+## Evals in CI: catching regressions before customers do
+
+The v15 incident needed one thing: an automatic check, before release, that compared the new prompt to the old one **per slice**. DukaanVoice now runs the eval suite in CI on every pull request that touches prompts, model routes, retrieval, normalisation rules or schemas.
+
+```ts title="evals/gate.ts"
+// Fails the build if any slice regresses beyond tolerance, even if the overall score improves.
+const TOLERANCE = 0.01; // one percentage point; runs vary a little because models are nondeterministic
+
+export function gate(candidate: SliceScores, baseline: SliceScores, minimums: Record<string, number>) {
+  const failures: string[] = [];
+  for (const [slice, score] of Object.entries(candidate)) {
+    const base = baseline[slice] ?? 0;
+    if (score < base - TOLERANCE) failures.push(`${slice}: ${pct(score)} vs ${pct(base)} in production`);
+    if (minimums[slice] && score < minimums[slice]) failures.push(`${slice}: below minimum ${pct(minimums[slice])}`);
+  }
+  return failures; // non-empty => CI fails, with the slices listed in the PR comment
+}
+```
+
+Practical details that make this work:
+
+- **Per-slice gates, not just an average.** The rule "no slice may drop by more than one point" would have blocked v15.
+- **Tolerances for noise.** Model outputs vary run to run, so a 0.2-point dip is not a regression. Run borderline suites more than once, or use larger slices.
+- **Cost and latency are part of the gate.** A prompt that improves accuracy by 0.5% and doubles the token count should fail review by default.
+- **Fast and slow suites.** A few hundred core cases on every pull request (a few minutes, a few hundred rupees); the full set nightly and before any model change.
+
+## Online metrics: the truth arrives later
+
+Offline evals tell you what the system does on the cases you have collected. **Online metrics** tell you what it does on real traffic, including cases you never imagined. DukaanVoice watches, per slice and per prompt and model version:
+
+- **Confirmation rate:** customers who confirm the first summary.
+- **Correction rate:** customers who reply "change", and shopkeepers who edit an order before packing. This is the best single quality signal DukaanVoice has, because it is a human saying "this was wrong".
+- **Clarification and escalation rates:** how often the system asks questions or escalates to the large model.
+- **Dead-letter and fallback rates.**
+- **Latency and cost per order.**
+
+These come almost for free from the order state machine and the gateway usage log. The important part is alerting **per slice**, so a regression for Hindi-speaking shops pages someone even when the platform-wide average looks fine.
+
+<Decision id="offline-vs-online" />
+
+## Tracing every model call
+
+When a shopkeeper reports a wrong order, you need to reconstruct exactly what happened: what the customer said, what the transcript was, what the catalog search returned, what the model was sent and what it answered, which prompt and model versions were used, how long each step took and what it cost. That is **tracing**.
+
+A **trace** follows one request (here, one voice note) through the whole system. It is made of **spans**, one per operation, each with a start time, duration and attributes. You may know traces from backend APM (application performance monitoring) tools; the standard for producing them is **OpenTelemetry** (OTel), which also has emerging semantic conventions for generative AI calls. Several observability products specialise in LLM traces, with views of prompts, completions and costs.
+
+A DukaanVoice order trace looks like this:
+
+| Span | Duration | Key attributes |
+| --- | --- | --- |
+| webhook.ingest | 38 ms | shop, message ID, signature valid |
+| queue.wait | 140 ms | queue depth at enqueue |
+| media.fetch | 320 ms | audio seconds, bytes |
+| stt.transcribe | 870 ms | provider, model, language hints, confidence |
+| catalog.search | 95 ms | candidates, top score, reranker used |
+| llm.extract_items | 1,050 ms | model version, prompt v16, tokens in and out, cost, cache hit, escalated |
+| order.create_draft | 22 ms | order ID, items, confidence route |
+| whatsapp.send | 280 ms | template or free-form, status |
+
+Store **redacted** prompt and response content (lesson 16), linked to the span, with a short retention period and restricted access. Sample full content at high volume, but keep the numeric attributes for every call. And link the trace ID to the order, so support can go from "order 0193 at Sri Lakshmi Kirana" to the full trace in one click.
+
+## Drift
+
+A system that passed every eval in March can be worse in October without anyone changing a line of code. That is **drift**, and it has three common sources:
+
+- **Input drift.** The world changes. DukaanVoice expands into new regions and languages, festival seasons bring new vocabulary, a new brand launches and everyone asks for it.
+- **Model drift.** A provider updates a model behind an alias, or you change a pinned version. Pin versions where you can, and treat upgrades as releases that must pass the full eval.
+- **Data drift.** Catalogs change, aliases accumulate, embeddings were computed with an older model.
+
+You catch drift with the online metrics above, broken down by slice and watched over weeks, not hours; with a **weekly human review** of a random sample of orders and analytics answers; and by checking whether new production inputs still look like your golden set (new languages, new regions, longer messages). When drift shows up, the response is the same loop as for any failure: collect examples, label them, add them to the golden set, fix, re-run.
+
+<Diagram
+  fig="15.1"
+  caption="The evaluation loop. Production failures become test cases; every change is gated offline and watched online."
+  label="Evaluation loop: production traffic produces traces and online metrics such as correction rate by slice. Failures, corrections and weekly samples are labelled and added to the golden dataset. Any change to prompts, models or retrieval runs offline evals in CI with per-slice gates. Changes that pass roll out as a canary, and online metrics are watched again."
+  chart={`flowchart TD
+  P["Production traffic"] --> T["Traces and online metrics by slice"]
+  T --> F["Failures, corrections, weekly samples"]
+  F --> L["Human labelling"]
+  L --> G[("Golden dataset with slices")]
+  CH["Change: prompt, model, retrieval"] --> CI["Offline evals in CI, per-slice gates"]
+  G --> CI
+  CI -->|"pass"| C["Canary rollout (lesson 20)"]
+  CI -->|"fail"| CH
+  C --> P
+`}
+/>
+
+## What the architecture looks like now
+
+DukaanVoice now has an evaluation system alongside the product: a sliced golden dataset of about 3,000 labelled orders that grows from every failure; stage-by-stage metrics; programmatic scorers for structured outputs and calibrated, narrow judges for free text; a CI gate with per-slice regression checks, cost and latency included; online correction and confirmation rates per slice and version; and OpenTelemetry traces for every order, with redacted model inputs and outputs. Prompt v16, which fixed Telugu numbers without breaking Hindi, passed every slice before it shipped.
+
+## Interview angle
+
+<Interview
+  ask="How do you know your AI feature works, and how do you stop a prompt change from making it worse?"
+  mistake="“We tested it on some examples” or “we use an LLM to grade it” with no mention of datasets, slices, calibration or online metrics."
+>
+
+- A golden dataset from real traffic and real failures, tagged by slice, with a held-out portion.
+- Stage-level metrics so you can locate failures.
+- Programmatic scoring for structured outputs; LLM judges only for free text, with known biases and calibration against humans.
+- Offline evals in CI with per-slice gates and tolerances, including cost and latency.
+- Online metrics, tracing of every model call, and a loop that turns production failures into test cases.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- An eval is a repeatable score on a fixed dataset. For nondeterministic components, it replaces “I tried it and it worked”.
+- Build the golden dataset from real traffic and every failure, tag it with slices, and keep a held-out part.
+- Score each pipeline stage separately; use code for structured outputs and narrow, calibrated LLM judges for free text.
+- Gate changes in CI per slice, with tolerances, and include cost and latency. Averages hide regressions.
+- Watch online metrics like correction rate per slice, trace every model call, and feed failures back into the dataset.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Prompt v15 improved overall accuracy slightly but made Hindi orders worse. Which practice would have caught it before release?",
+      options: [
+        "Per-slice regression gates in CI, run on a golden dataset tagged by language",
+        "Testing the new prompt on more Telugu examples by hand",
+        "Switching to a larger model for every order",
+        "Raising the overall accuracy threshold from 95% to 97%",
+      ],
+      answer: "A",
+      why: "The regression was invisible in the aggregate and visible in the Hindi slice. More hand-testing of Telugu would not cover Hindi, a larger model does not detect regressions, and a stricter overall threshold can still pass while one slice drops.",
+    },
+    {
+      q: "Which is a well-known bias of LLM-as-judge setups?",
+      options: [
+        "They cannot read JSON outputs",
+        "They always give the lowest possible score",
+        "They tend to prefer longer answers and can favour an answer because of its position in a comparison",
+        "They only work when the judge is the same model that produced the answer",
+      ],
+      answer: "C",
+      why: "Verbosity and position bias are documented. Judges read JSON fine, do not systematically give minimum scores, and are often better as a different model, because self-preference is another known bias.",
+    },
+    {
+      q: "Which online metric is the strongest signal that DukaanVoice's orders are coming out wrong?",
+      options: [
+        "Average number of messages per conversation",
+        "Correction rate: customers changing the summary and shopkeepers editing orders before packing",
+        "The number of voice notes received per hour",
+        "Average transcript length",
+      ],
+      answer: "B",
+      why: "A correction is a human explicitly saying the output was wrong. Message counts and transcript length depend on many things, and volume per hour measures traffic, not quality.",
+    },
+  ]}
+/>

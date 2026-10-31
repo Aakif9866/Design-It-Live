@@ -1,3 +1,273 @@
 ## The problem
 
-Coming soon.
+It is a Friday evening, three weeks before Diwali, and three things go wrong in the same hour.
+
+First, DukaanVoice's LLM provider has a partial outage. For 40 minutes, a third of calls fail with `503` errors. Voice workers retry, then dead-letter. About 2,600 orders end up in the dead-letter queue, and the team spends the night replaying them by hand.
+
+Second, a large supermarket in Visakhapatnam, DukaanVoice's biggest customer, starts a bulk catalog import of 12,000 products. The import job calls the LLM to clean up every product name, and it uses so much of the account's tokens-per-minute limit that ordinary customer orders across all 2,000 shops start receiving `429 Too Many Requests`.
+
+Third, the finance lead asks a simple question for a pricing review: "How much AI cost does the Visakhapatnam shop generate per month, compared to a normal kirana?" Nobody can answer. Model calls are made from four places in the code, with two API keys, and usage is logged differently in each.
+
+All three problems have the same root cause: there is no single place where model calls are controlled. This lesson builds one.
+
+## What an LLM gateway is
+
+An **LLM gateway** is one internal service (or, to start, one module) that sits between your application and every model provider. Business code never calls a provider directly. It calls the gateway with a task name and the inputs, and the gateway decides which model to call, enforces limits, retries, falls back, caches and logs.
+
+<Diagram
+  fig="10.1"
+  caption="The LLM gateway. One entry point for every model call, with routing, limits, caching and logging in one place."
+  label="LLM gateway architecture: voice workers, the analytics agent and batch jobs all call the gateway with a task, a shop ID and inputs. Inside the gateway, requests pass through per-shop quota and rate limit checks, an exact-match cache, a router that picks a model chain for the task, and adapters for provider A, provider B and a speech-to-text provider. Every call is logged with tokens, cost, latency and prompt version to a usage store."
+  chart={`flowchart TD
+  W["Voice workers"] --> G
+  AG["Analytics agent"] --> G
+  B["Batch jobs"] --> G
+  subgraph G["LLM gateway"]
+    Q["Per-shop quota and rate limit"] --> C["Exact-match cache"]
+    C --> RT["Router: task to model chain"]
+    RT --> A1["Adapter: provider A"]
+    RT --> A2["Adapter: provider B"]
+  end
+  A1 --> PA["Provider A"]
+  A2 --> PB["Provider B"]
+  G -.-> LOG[("Usage log: tokens, cost, latency, prompt version")]
+  G -.-> RC[("Redis: limits and cache")]
+`}
+/>
+
+If you have used an API gateway for HTTP services, the idea is familiar: concentrate cross-cutting concerns in one place so every caller benefits. What is special about an LLM gateway is which concerns it handles: token-based limits, cost attribution, model fallbacks and caching of expensive, nondeterministic outputs.
+
+## Provider abstraction
+
+Providers differ in small, annoying ways: how messages and roles are structured, how tool calls are represented, what usage fields come back, which error codes mean "slow down" versus "you sent something invalid". The gateway's **adapters** translate between one internal format and each provider's format.
+
+Keep the abstraction **thin**. A common mistake is to design the lowest common denominator of every provider and lose the features that make each one worth using: structured output modes, prompt caching controls, reasoning settings. A better shape is a small common core (messages, a schema or tool list, limits) plus an escape hatch for provider-specific options, configured per task.
+
+The gateway is also the only component that holds **provider API keys**. Business code never sees them, and rotating a key is a gateway config change.
+
+## Routing by task
+
+Business code should not say "call model X". It should say what it is trying to do: `extract_items`, `classify_intent`, `write_reply`, `answer_analytics`. The gateway maps each task to a **chain** of models, in order of preference, defined in config:
+
+```ts title="gateway/routes.ts"
+type Route = { model: string; timeoutMs: number; maxOutputTokens: number };
+
+// Model ids are placeholders: pin real, dated model versions in your config.
+export const ROUTES: Record<Task, { chain: Route[]; escalateTo?: Route; priority: Priority }> = {
+  classify_intent: {
+    priority: "interactive",
+    chain: [
+      { model: "providerA/small-2025-xx", timeoutMs: 2_000, maxOutputTokens: 20 },
+      { model: "providerB/small-2025-xx", timeoutMs: 2_000, maxOutputTokens: 20 },
+    ],
+  },
+  extract_items: {
+    priority: "interactive",
+    chain: [
+      { model: "providerA/small-2025-xx", timeoutMs: 4_000, maxOutputTokens: 400 },
+      { model: "providerB/small-2025-xx", timeoutMs: 4_000, maxOutputTokens: 400 },
+    ],
+    escalateTo: { model: "providerA/large-2025-xx", timeoutMs: 8_000, maxOutputTokens: 400 },
+  },
+  clean_product_name: {
+    priority: "batch",
+    chain: [{ model: "providerB/small-2025-xx", timeoutMs: 15_000, maxOutputTokens: 60 }],
+  },
+};
+```
+
+Routing in config means changing a model is a reviewed, testable, reversible change, not a code hunt. It also makes the next three features possible.
+
+## Fallbacks
+
+When a provider fails with a timeout, `429` or `5xx`, the gateway moves to the next model in the chain. In the Friday outage, extraction would have shifted to provider B within a second, and customers would have noticed nothing.
+
+```ts title="gateway/complete.ts"
+export async function complete(req: GatewayRequest): Promise<GatewayResult> {
+  const route = ROUTES[req.task];
+  let lastError: unknown;
+
+  for (const step of route.chain) {
+    if (breaker.isOpen(step.model)) continue;                  // skip providers known to be down (lesson 18)
+    try {
+      const res = await adapters.call(step, req, AbortSignal.timeout(Math.min(step.timeoutMs, req.deadlineMs - Date.now())));
+      breaker.recordSuccess(step.model);
+      return res;
+    } catch (err) {
+      lastError = err;
+      breaker.recordFailure(step.model);
+      if (!isRetryableAcrossProviders(err)) throw err;         // a 400 will fail everywhere: stop
+    }
+  }
+  throw new AllProvidersFailedError(req.task, lastError);      // caller degrades (ask the customer to type)
+}
+```
+
+Three details matter more than the loop itself:
+
+- **Fallback models must be evaluated too.** A prompt tuned for one model can behave differently on another: different JSON habits, different handling of Hinglish. Each model in a chain must pass the same evaluation set (lesson 15) before it goes into config. An untested fallback turns an outage into a silent quality incident.
+- **Do not fall back on client errors.** A `400` (invalid request) or a content-policy rejection will fail on every provider. Falling back just multiplies the cost of a bug.
+- **Respect the deadline.** The request carries an absolute deadline from the voice pipeline's budget. If 5 of the 6 seconds are gone, there is no point starting an 8-second call to a large model. Passing remaining time down the call chain like this is called **deadline propagation**.
+
+The **circuit breaker** in that code (`breaker.isOpen`) stops sending traffic to a provider that is clearly failing, instead of making every request wait for a timeout first. Lesson 18 explains how it works.
+
+## Cascades: try cheap first, escalate when unsure
+
+A fallback handles failure. A **cascade** handles difficulty. Most DukaanVoice orders are easy ("2 kilo atta, ek Surf Excel"), and a small model handles them well. A few are genuinely hard ("same as last time but no Maggi, and the bigger oil, not the one from Tuesday"). A cascade sends every request to the small model first and escalates to a large model only when there is a signal that the small one struggled.
+
+<Diagram
+  fig="10.2"
+  caption="A model cascade. The expensive model only sees the requests the cheap one could not handle confidently."
+  label="Cascade: every transcript goes to the small model. If its output fails schema validation, refers to items not found in the catalog, or reports low confidence, the request escalates to the large model. If the large model is also unsure, the customer gets a clarifying question. About 92% of orders finish at the small model."
+  chart={`flowchart TD
+  T["Transcript"] --> S["Small model extracts items"]
+  S --> V{"Valid, matched and confident?"}
+  V -->|"yes, about 92%"| OK["Use the result"]
+  V -->|"no, about 8%"| L["Large model extracts items"]
+  L --> V2{"Valid, matched and confident?"}
+  V2 -->|"yes"| OK
+  V2 -->|"no"| ASK["Ask the customer a clarifying question"]
+`}
+/>
+
+The escalation signals must be things code can check, not vibes:
+
+- The output fails **schema validation** (lesson 11).
+- Extracted items do not **match the catalog** with good enough similarity (lesson 12).
+- The model's own **confidence** field is low, or it flags ambiguity. Self-reported confidence is a weak signal on its own, so it is combined with the others.
+- The input has known hard features: very long, many items, references to past orders.
+
+Now the economics. On DukaanVoice's evaluation set, the small model handles about 92% of orders confidently. Escalation re-runs only the extraction step on the large model, about ₹0.45 per escalated order. So the expected LLM cost per order is about ₹0.05 (small model, every order) + 8% × ₹0.45 ≈ **₹0.09**. With speech-to-text at about ₹0.10, the total is about **₹0.19 per order**, inside the ₹0.25 budget from lesson 2, with large-model accuracy on the hard cases. Lesson 17 pushes this further.
+
+## Timeouts, retries and hedging
+
+The gateway centralises the retry logic from lesson 7, with per-task timeouts in the route config. A short timeout for classification (2 s), a longer one for extraction (4 s), a much longer one for batch jobs.
+
+One more technique is worth knowing. **Hedged requests** send a second, identical request to another provider if the first has not answered within, say, its usual p95 latency, and use whichever finishes first. This cuts tail latency noticeably. It also costs money on every hedge, so use it only on the interactive path, only after the p95 delay, and cap the fraction of requests that can be hedged.
+
+## Per-tenant rate limits and quotas
+
+The Visakhapatnam import starved everyone because all shops shared one pool of provider capacity with no fairness. The gateway fixes that at three levels:
+
+- **Per-shop rate limits.** Each shop gets a budget of requests or tokens per minute, enforced with a token bucket in Redis (lesson 18 builds one). A runaway import hits its own limit, not everyone else's.
+- **Priority classes.** Customer orders are `interactive`; shopkeeper questions are `interactive` but lower priority; catalog clean-ups and nightly summaries are `batch`. When the provider is near its TPM limit, the gateway delays batch work first. Batch tasks can also use providers' batch APIs at a discount.
+- **Monthly quotas per plan.** Each pricing plan includes a monthly AI allowance. A shop approaching it gets a warning, then degraded features (no voice replies, slower analytics answers), never a broken order flow.
+
+The gateway also keeps a **global concurrency limit per provider**, sized to stay under the account's TPM, so DukaanVoice slows itself down gracefully instead of being slowed down by a storm of `429`s.
+
+## Logging and cost attribution
+
+Every gateway call writes one usage record: timestamp, shop, task, model version, prompt version, input, output and cached tokens, latency, cost in paise, cache hit or miss, fallback or escalation, and a trace ID that links back to the order. That record answers the finance question with one SQL query. It also drives dashboards for cost per order, escalation rate and error rate by provider, which lessons 15 and 17 depend on.
+
+Logging the **full prompts and responses** is more delicate. You want them for debugging and evals, but they contain customer messages, names and addresses. The gateway logs full content only after redaction (lesson 16), keeps it for a short, defined period, restricts who can read it, and samples it rather than keeping everything at Diwali volumes.
+
+## Caching
+
+The gateway is the natural place to cache model results, because it sees every request. There are three different things that all get called "caching", and they have very different safety profiles.
+
+### Exact-match caching
+
+Hash everything that affects the output (task, model version, prompt version, normalised input, relevant shop ID) and store the result. If the identical request comes again, return the stored answer without calling a model. This is safe because the inputs are truly identical, and it pays off where inputs repeat: FAQ answers, product-name cleaning of the same raw string, intent classification of very common short messages like "ok" or "haan".
+
+The cache key **must include the shop ID** whenever the output depends on shop data, and the model and prompt versions, so a prompt change does not serve stale answers.
+
+### Semantic caching
+
+A **semantic cache** embeds the request as a vector (lesson 12) and returns a cached answer if a previous request was similar enough. "Do you deliver on Sunday?" and "Sunday ko delivery hai kya?" are different strings with the same meaning, so a semantic cache can answer the second from the first.
+
+The danger is in the word "similar". "2 kilo atta" and "2 kilo maida" are very close in embedding space and must never share an answer. Semantic caching is safe only where similar questions genuinely have the same answer and a wrong hit is cheap: a shop's FAQs, yes; order extraction, never.
+
+### Provider-side prompt caching
+
+The third kind happens at the provider. If many requests share an identical **prefix** (the same system instructions, the same tool definitions, the same shop context), many providers can reuse their computation for that prefix and charge less for those cached input tokens, and often answer faster. Some do it automatically, some need you to mark the cacheable section, and cached prefixes usually expire after a few minutes of inactivity. Discounts and rules vary a lot by vendor.
+
+To benefit, order the prompt from most stable to most variable:
+
+1. System instructions and output format (identical for every request of this task).
+2. Tool definitions.
+3. Shop-specific context (same for every request to this shop for a while).
+4. Conversation history.
+5. The new message.
+
+Putting the timestamp or customer name at the top of the prompt, a common habit, breaks the shared prefix and quietly loses the discount on every call.
+
+<Decision id="semantic-cache" />
+
+## Build or buy?
+
+Open-source gateways and proxies, and hosted gateway products, provide much of this out of the box: a unified API, fallbacks, logging, budgets. They are a good choice when you need many providers quickly and your needs match the product. DukaanVoice's needs are tied to its own data model (per-shop quotas tied to plans, cost per order, deadline propagation from the voice pipeline), and it calls only two or three providers. The team starts with a thin module inside the monolith, a few hundred lines, and keeps the option of extracting it to a service or adopting a product later.
+
+<Decision id="gateway-build-buy" />
+
+## What the architecture looks like now
+
+Every model call, including speech-to-text, now goes through the gateway. It routes by task to pinned model versions, falls back across two providers with a circuit breaker, escalates hard extractions to a large model, enforces per-shop limits and priority classes, caches exact repeats and shop FAQs, orders prompts for provider-side caching, and writes one usage record per call. Provider keys live only in the gateway.
+
+When provider A has its next bad evening, orders shift to provider B in about a second. When the next big import starts, it waits its turn. And the finance lead gets an answer to "what does the Visakhapatnam shop cost us?" in one query: about ₹0.21 per order, slightly above average, because their customers order more items per message.
+
+## Interview angle
+
+<Interview
+  ask="You depend on one LLM provider. How do you make the system resilient and keep costs under control?"
+  mistake="Saying “we'll add a second provider” without addressing prompt compatibility and evaluation of the fallback model, or proposing a semantic cache for requests whose answers depend on exact details."
+>
+
+- A gateway as the single point for routing, fallbacks, limits, caching, logging and keys.
+- Fallbacks for availability, cascades for cost, and the checkable signals that trigger escalation.
+- Per-tenant rate limits and priority classes to stop noisy neighbours.
+- Cost attribution per tenant and per task from one usage record.
+- Clear distinctions between exact caching, semantic caching and provider prompt caching, with the risks of each.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Put every model call behind one gateway: routing by task, fallbacks, retries with deadlines, per-tenant limits, caching, logging and key management.
+- Fallbacks keep you available during outages, but only models that pass your evals belong in a chain.
+- Cascades (cheap model first, escalate on checkable signals) give large-model accuracy at close to small-model cost.
+- Per-shop rate limits, priority classes and quotas stop one tenant from starving the rest.
+- Exact caching is safe; semantic caching only where similar inputs truly share an answer; structure prompts stable-first to benefit from provider prompt caching.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Provider A returns `400 Bad Request` because the request had an invalid tool schema. What should the gateway do?",
+      options: [
+        "Fall back to provider B immediately",
+        "Stop and raise the error, since a malformed request will fail on every provider",
+        "Retry provider A with exponential backoff",
+        "Escalate the request to the large model",
+      ],
+      answer: "B",
+      why: "A 400 is a client error: the request itself is wrong. Retrying, falling back or escalating repeats the same mistake and multiplies cost. Fallbacks are for timeouts, 429s and 5xx errors.",
+    },
+    {
+      q: "A small model handles 92% of orders at ₹0.05 each. The other 8% also go to a large model costing ₹0.45 per escalated order. What is the expected LLM cost per order?",
+      options: [
+        "About ₹0.09",
+        "About ₹0.05, because most orders use the small model",
+        "About ₹0.45, because the large model sets the price",
+        "About ₹0.25, the average of the two prices",
+      ],
+      answer: "A",
+      why: "Every order pays for the small model (₹0.05), and 8% also pay ₹0.45: 0.05 + 0.08 × 0.45 ≈ ₹0.086. Ignoring the escalations underestimates cost; a simple average ignores the weights.",
+    },
+    {
+      q: "Which use of a semantic cache is safe for DukaanVoice?",
+      options: [
+        "Caching item extraction, so “2 kilo atta” and “2 kilo maida” can share a result",
+        "Caching order summaries across shops to save tokens",
+        "Caching payment-link messages per customer",
+        "Answering a shop's FAQ, such as Sunday delivery, from a semantically similar earlier question to the same shop",
+      ],
+      answer: "D",
+      why: "FAQs are a case where similar questions really do have the same answer, scoped to one shop. Extraction depends on exact details that embeddings blur, summaries across shops would leak data, and payment messages are per order and must never be reused.",
+    },
+  ]}
+/>

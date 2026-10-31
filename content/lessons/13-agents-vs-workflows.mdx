@@ -1,3 +1,269 @@
 ## The problem
 
-Coming soon.
+DukaanVoice is at 10,000 shops and about 300,000 orders a day. The most requested feature from shopkeepers is not about orders at all. It is questions:
+
+- "Which items are running low?"
+- "What sold most this week compared to last week?"
+- "Sales dropped on Tuesday. Why?"
+- "Diwali is in three weeks. What should I order from my distributor?"
+
+The product manager has been reading about AI agents and proposes something bigger: "Let's make the whole product an agent. Give it all the tools (search, stock, orders, payments, notifications) and let it figure out what to do with each message. Orders and questions, one brain."
+
+Farhan builds a prototype over a week. In testing, it handles some genuinely tricky conversations beautifully. It also:
+
+- skipped the stock check on 3% of orders, because it "remembered" the item was in stock from earlier in the conversation;
+- once made 23 tool calls on a simple order, searching for every word in the message, at a cost of about ₹8;
+- once sent a payment link before the customer confirmed, because the customer said "ok" to a question about delivery time.
+
+This lesson is about when to let the model decide what happens next, and when to decide it yourself.
+
+## Workflows and agents
+
+The words get used loosely, so here are working definitions:
+
+- A **workflow** is a process whose steps are defined in **code**. LLM calls may appear inside steps (extract items, write a reply), but the sequence, the branches and the stopping point are fixed by you.
+- An **agent** is a loop in which the **model decides** the next step: which tool to call, with what arguments, and when it is done. Your code runs the tools and enforces limits, but the path is chosen at runtime by the model.
+
+In practice there is a spectrum: a single model call; a fixed chain of calls; a router that picks one of several fixed paths; a workflow with model-powered steps; and, at the far end, an open agent loop. Each step along it buys flexibility and pays in predictability, cost and testability. The practical rule is to **use the simplest point on the spectrum that handles the task**.
+
+## The order flow is a workflow
+
+Look at what an order needs: extract, search, check stock, build a summary, wait for confirmation, reserve stock, create a payment link, wait for payment, notify the shop. The steps are known. The order matters (never a payment link before confirmation). Some steps move money. It must be fast and cheap, and you must be able to test every path.
+
+That is the textbook case for a workflow. The model is still essential inside it: it extracts items, chooses between catalog candidates through the short tool loop from lesson 11, and handles ambiguity. But it does not decide whether to check stock, and it cannot skip confirmation. Those are not judgement calls; they are rules.
+
+The cleanest way to express the order lifecycle is a **state machine**: a fixed set of states and the allowed transitions between them, each triggered by an event.
+
+<Diagram
+  fig="13.1"
+  caption="The order lifecycle as a state machine. The model can propose a draft; only code moves an order between states."
+  label="Order state machine: an order starts as draft, moves to awaiting confirmation when the summary is sent, to confirmed when the customer replies yes, to payment pending when the link is created, and to paid when the payment webhook is verified. Paid orders move to packed and delivered. Drafts and unconfirmed orders expire after a timeout, and payment-pending orders release their stock and expire after 15 minutes. Several states can move to cancelled."
+  chart={`stateDiagram-v2
+  [*] --> draft: model proposes items
+  draft --> awaiting_confirmation: summary sent
+  awaiting_confirmation --> confirmed: customer replies 1
+  awaiting_confirmation --> draft: customer asks to change
+  awaiting_confirmation --> expired: no reply in 2 hours
+  confirmed --> payment_pending: stock reserved, link created
+  payment_pending --> paid: payment verified
+  payment_pending --> expired: 15 minutes, stock released
+  paid --> packed
+  packed --> delivered
+  delivered --> [*]
+  draft --> cancelled
+  awaiting_confirmation --> cancelled
+  confirmed --> cancelled
+`}
+/>
+
+```ts title="orders/state.ts"
+const TRANSITIONS = {
+  draft: ["awaiting_confirmation", "cancelled"],
+  awaiting_confirmation: ["confirmed", "draft", "expired", "cancelled"],
+  confirmed: ["payment_pending", "cancelled"],
+  payment_pending: ["paid", "expired"],
+  paid: ["packed"],
+  packed: ["delivered"],
+} as const satisfies Partial<Record<OrderStatus, readonly OrderStatus[]>>;
+
+export async function transition(tx: Tx, orderId: string, from: OrderStatus, to: OrderStatus) {
+  if (!(TRANSITIONS[from as keyof typeof TRANSITIONS] as readonly string[] | undefined)?.includes(to)) {
+    throw new ApiError(409, "invalid_transition", `Cannot move order from ${from} to ${to}`);
+  }
+  // Compare-and-set: only succeeds if nobody else moved the order first
+  const { rowCount } = await tx.query(`UPDATE orders SET status = $3 WHERE id = $1 AND status = $2`, [orderId, from, to]);
+  if (rowCount === 0) throw new ApiError(409, "stale_state", "Order changed concurrently");
+}
+```
+
+The "ok" incident cannot happen with this design. The only path to `payment_pending` goes through `confirmed`, and the only thing that produces `confirmed` is a deterministic handler that checks the customer's reply is an explicit confirmation of the summary they were sent.
+
+## The analytics assistant is an agent
+
+Now look at "Sales dropped on Tuesday. Why?". The path to an answer depends on what the data shows. Maybe one product sold out; maybe it rained; maybe the shop was closed in the afternoon; maybe a big regular customer did not order. You cannot enumerate the steps in advance, and a fixed dashboard would not anticipate the question.
+
+It is also **read-only**. The worst a wrong step can do is waste some tokens or produce a weak answer, which the shopkeeper can see and ignore. Open-ended, read-only and low stakes is exactly where an agent earns its cost.
+
+<Decision id="workflow-vs-agent" />
+
+### Designing the analytics agent
+
+The agent gets a small set of read-only tools, each a well-defined query over the shop's data on a **read replica** (lesson 6), with the shop ID injected by the server:
+
+- `salesSummary(from, to, groupBy)` for totals by day, product or category.
+- `lowStock(threshold)` for products below a threshold, with their recent daily sales rate.
+- `productTrend(productId, weeks)` for one product's weekly sales.
+- `orderTimeline(date)` for orders per hour on one day, which reveals closures and quiet periods.
+- `festivalCalendar(from, to)` for upcoming festivals in the shop's region.
+
+Why not give the model raw SQL access, so it can answer anything? **Text-to-SQL** is powerful and sometimes the right call, but it widens the blast radius: queries that scan huge tables, subtle wrong joins that produce confident wrong numbers, and a much harder security story, even with a read-only role and row-level security. Named tools with typed parameters are less flexible and far easier to test, secure and explain. Start with tools; add a constrained SQL tool only when you see questions that the tools cannot answer.
+
+### The loop, with limits
+
+An agent without limits is an open-ended bill. The loop below has four, and every one of them has fired in production:
+
+```ts title="agents/analytics.ts"
+const LIMITS = { maxSteps: 8, maxCostPaise: 200, maxMs: 30_000 };
+
+export async function answerShopQuestion(shopId: string, question: string) {
+  const started = Date.now();
+  let costPaise = 0;
+  const messages = buildAnalyticsPrompt(shopId, question);
+  const seen = new Set<string>();
+
+  for (let step = 0; step < LIMITS.maxSteps; step++) {
+    if (costPaise > LIMITS.maxCostPaise || Date.now() - started > LIMITS.maxMs) break;
+
+    const res = await gateway.complete({ task: "answer_analytics", shopId, messages, tools: ANALYTICS_TOOLS });
+    costPaise += res.costPaise;
+    if (!res.toolCalls.length) return { answer: res.text, steps: step + 1, costPaise };
+
+    for (const call of res.toolCalls) {
+      const key = `${call.name}:${JSON.stringify(call.args)}`;
+      const result = seen.has(key)
+        ? { error: "You already called this tool with these arguments. Use the earlier result." }
+        : await runReadOnlyTool(shopId, call);                 // validates args, injects shopId
+      seen.add(key);
+      messages.push(toolResultMessage(call, result));
+    }
+  }
+  return { answer: "I couldn't finish this analysis. Here is what I found so far: ...", partial: true, costPaise };
+}
+```
+
+- **A step limit** stops loops. Eight is generous for these questions; most finish in three.
+- **A cost limit** caps the bill per question at ₹2, which is about what the shop pays DukaanVoice per order.
+- **A time limit** keeps the experience bounded; the answer streams to the app as it is written.
+- **Repeat detection** catches the most common loop, calling the same tool with the same arguments again and again.
+
+When a limit fires, the agent returns a partial answer and says so, rather than failing silently or pretending to be sure. The final prompt also asks for every number in the answer to come from a tool result, and an eval (lesson 15) checks that it does.
+
+<Diagram
+  fig="13.2"
+  caption="The analytics agent loop. The model chooses tools; code enforces the limits and owns the data access."
+  label="Agent loop: the shopkeeper's question goes to the model with a list of read-only tools. If the model requests a tool, code checks the step, cost and time limits and repeated calls, runs the tool against the read replica with the shop ID injected, and returns the result to the model. When the model answers without a tool call, the answer streams to the app. If a limit is hit, a partial answer is returned."
+  chart={`flowchart TD
+  Q["Shopkeeper question"] --> M["Model with read-only tools"]
+  M -->|"requests a tool"| L{"Within steps, cost and time? Not a repeat?"}
+  L -->|"yes"| T["Run tool on read replica, shop_id injected"]
+  T --> M
+  L -->|"no"| P["Return partial answer, say so"]
+  M -->|"final answer"| A["Stream answer to the app"]
+`}
+/>
+
+## Durable execution: state that survives crashes
+
+Back to the order workflow, which has a property that is easy to miss: it is **long-running**. It waits up to two hours for a confirmation and fifteen minutes for a payment, then releases stock if nothing happens. A process can crash, be redeployed or be scaled down at any point in that wait. If the workflow's state lives only in memory (a `setTimeout` waiting to release stock), a deploy loses it. Stock stays reserved forever.
+
+There are two common ways to make long-running workflows survive:
+
+1. **State in the database plus scheduled jobs.** The order's status column **is** the workflow state, as in the state machine above. Timeouts are delayed jobs in the queue (BullMQ supports delays) that check the state when they fire: "if order X is still `payment_pending`, expire it and release the stock". Each handler is idempotent. This is what DukaanVoice uses, and it is enough for most products.
+2. **A durable execution engine.** Tools like Temporal, Inngest, Restate or AWS Step Functions let you write the workflow as ordinary-looking code, and the engine records the result of every step. If the process dies, the workflow resumes on another machine from the last completed step, with timers and waits that can last days.
+
+```ts title="Illustrative durable workflow (API shapes vary by engine)"
+export const orderWorkflow = workflow("order", async ({ orderId }, step) => {
+  await step.run("send-summary", () => sendSummary(orderId));              // result recorded; not re-run on replay
+  const reply = await step.waitForEvent("customer.replied", { match: orderId, timeout: "2h" });
+  if (!reply || !isConfirmation(reply)) return step.run("expire", () => expireOrder(orderId));
+
+  await step.run("reserve-and-link", () => reserveStockAndCreateLink(orderId));
+  const paid = await step.waitForEvent("payment.verified", { match: orderId, timeout: "15m" });
+  if (!paid) return step.run("release", () => releaseStockAndExpire(orderId));
+  await step.run("notify-shop", () => notifyShopkeeper(orderId));
+});
+```
+
+The code reads top to bottom like the business process, which is the main attraction. The rules that come with it: steps with side effects must be idempotent (they can be retried), and the workflow code between steps must be deterministic, because the engine replays it to rebuild state. Durable engines become worth their operational cost when you have many long, multi-step processes with timers, compensation steps and retries. For agents that run for minutes and call many tools, the same idea applies: persist each step's result so a crash does not repeat expensive or side-effecting work.
+
+## MCP: a standard way to expose tools
+
+As more products add agents, a new problem appears: every agent framework and every AI app describes tools differently. The **Model Context Protocol** (MCP) is an open standard, originally published by Anthropic and now supported across much of the AI tooling ecosystem, for exposing tools, data ("resources") and prompt templates to AI applications in one consistent way. You write an **MCP server** that offers capabilities; any MCP-compatible **client** (an assistant app, an IDE, an agent framework) can discover and call them.
+
+For DukaanVoice, MCP is useful at the edges, not in the core:
+
+- **Internally**, the order workflow and the analytics agent just call functions. Wrapping internal calls in a protocol would add hops for no benefit.
+- **Externally**, a "DukaanVoice MCP server" could expose a shop's read-only analytics tools so that a shopkeeper (or their accountant) could use them from whatever AI assistant they prefer, or so partner systems like distributors could query stock levels with the shop's permission.
+
+If you do expose an MCP server, treat it like any public API: real authentication (the specification uses OAuth for remote servers), per-shop authorisation on every call, read-only by default, rate limits, and the assumption that the calling model may have been manipulated by a prompt injection. MCP standardises **how** tools are described and called; it does not make them safe.
+
+## Multiple agents
+
+You will also see **multi-agent** designs: a "planner" agent handing tasks to "researcher" and "writer" agents, or a team of specialists talking to each other. They can help when subtasks are genuinely independent and can run in parallel, when they need separate contexts that would not fit together, or when they need different permissions.
+
+They also multiply cost and latency, add hand-offs where information gets lost, and are much harder to evaluate and debug. The analytics assistant answers one shop's question over one shop's data. A single agent with a few good tools is simpler, cheaper and better here. A good rule: make one agent work well, and split it only when you can name a specific limit it hits.
+
+<Decision id="single-vs-multi-agent" />
+
+## What the architecture looks like now
+
+Two styles now live side by side. Orders run through a **workflow**: a state machine in Postgres with compare-and-set transitions, delayed jobs for timeouts, model calls only inside specific steps, and no path to payment except through explicit confirmation. Shopkeeper questions go to a **bounded agent** with five read-only tools on a read replica, step, cost and time limits, repeat detection and streamed answers. Analytics tools could later be exposed through an MCP server for outside assistants, with proper authentication.
+
+The prototype's 3% skipped stock checks and its ₹8 order are gone, and shopkeepers now ask about 40,000 questions a day at an average cost of about ₹0.60 each.
+
+## Interview angle
+
+<Interview
+  ask="Should this feature be built as an AI agent?"
+  mistake="Making everything an agent because it is fashionable, or refusing agents entirely. Interviewers want a reasoned split based on predictability, stakes and how open-ended the task is."
+>
+
+- Clear definitions: in a workflow, code decides the steps; in an agent, the model does.
+- Workflows (often state machines) for known, consequential processes such as orders and payments; agents for open-ended, read-only, low-stakes tasks.
+- Concrete agent limits: steps, cost, time, repeat detection, partial answers.
+- Durable state for long-running processes, through database state and scheduled jobs or a durable execution engine.
+- A sober view of MCP (a standard interface for tools, not a security model) and of multi-agent systems.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- Use the simplest point on the spectrum: single call, chain, router, workflow, agent. Each step adds flexibility and loses predictability.
+- Anything that moves money or has fixed rules belongs in a workflow, ideally an explicit state machine with compare-and-set transitions.
+- Agents fit open-ended, read-only tasks. Give them a few typed tools and hard limits on steps, cost and time.
+- Long-running processes need durable state: database state plus scheduled jobs, or a durable execution engine with idempotent steps.
+- MCP standardises how tools are exposed to AI apps; you still own authentication, authorisation and limits. Prefer one good agent over many.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Which DukaanVoice feature is the best fit for an agent loop rather than a fixed workflow?",
+      options: [
+        "Creating a payment link after the customer confirms",
+        "Releasing reserved stock after 15 minutes without payment",
+        "Answering “why did my sales drop on Tuesday?” using read-only analytics tools",
+        "Sending the order summary for confirmation",
+      ],
+      answer: "C",
+      why: "The Tuesday question is open-ended and read-only: the right steps depend on what the data shows, and a weak step only costs tokens. The other three are fixed, consequential steps with clear rules, which belong in a workflow.",
+    },
+    {
+      q: "The order workflow waits 15 minutes for payment, then releases stock. Why is `setTimeout` inside the worker process a bad way to implement this?",
+      options: [
+        "setTimeout is not accurate to the second",
+        "Node.js does not allow timers longer than one minute",
+        "It would make the order flow nondeterministic",
+        "If the process crashes or is redeployed during the wait, the timer is lost and the stock stays reserved",
+      ],
+      answer: "D",
+      why: "The state of the wait only exists in that process's memory. Long-running workflows need durable state: a delayed job that checks the order status, or a durable execution engine. Timer accuracy is irrelevant here, and Node supports long timers.",
+    },
+    {
+      q: "What does exposing DukaanVoice's analytics tools through an MCP server give you, and what does it not?",
+      options: [
+        "It encrypts tool results so they are safe from prompt injection",
+        "A standard way for MCP-compatible AI apps to discover and call the tools; you still need authentication, per-shop authorisation and limits",
+        "It removes the need for tool parameter validation, because the protocol validates arguments",
+        "It lets the model run SQL directly against the primary database",
+      ],
+      answer: "B",
+      why: "MCP standardises how tools are described and called across clients. It is not a security layer: you still authenticate callers, authorise per shop, validate arguments and rate limit. It neither encrypts against injection nor grants database access.",
+    },
+  ]}
+/>

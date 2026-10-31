@@ -1,3 +1,253 @@
 ## The problem
 
-Coming soon.
+The `searchCatalog` tool from lesson 11 started life as a simple `ILIKE '%atta%'` query. At 2,000 shops, its failures are now the biggest source of clarifying questions:
+
+- "surf exel" finds nothing. Neither does "sarf", "Surf Exl" or "सर्फ एक्सेल".
+- "washing powder" finds nothing, because no product is literally called that.
+- "Parle G" misses "Parle-G Gold 100 g" because of the hyphen.
+- When Farhan tried a quick fix with pure vector search, "Surf Excel" started matching **Ariel** and **Tide** with high scores. They are all detergents, so their embeddings are close. A customer who names a brand wants that brand.
+
+Meanwhile, customers ask questions the catalog cannot answer: "Do you deliver to Madhapur?", "Can I pay cash?", "What time do you close on Sunday?". Each shop has typed its answers into a settings page as free text.
+
+Both problems are **retrieval** problems: finding the right few pieces of information, out of many, to give the model. This lesson builds retrieval that works on Hinglish, brand names and stale prices.
+
+## What RAG is, in one paragraph
+
+**Retrieval-augmented generation** (RAG) means: before asking the model to answer, retrieve the most relevant pieces of your own data and put them in the context. The model then answers from that data instead of from its general training. In lesson 8 you saw why you cannot simply send everything: cost, latency and quality all suffer. RAG is the discipline of sending the right 1% instead.
+
+DukaanVoice uses retrieval in three places:
+
+- **Catalog matching** inside the order flow, through the `searchCatalog` tool.
+- **Shop FAQs** for customer questions about delivery areas, timings and payment options.
+- **Help articles** for shopkeepers asking how to use the app.
+
+The catalog is the hardest and most important, so most of this lesson is about it.
+
+## Embeddings, briefly
+
+An **embedding model** turns a piece of text into a **vector**: a list of numbers, often hundreds or a few thousand long. It is trained so that texts with similar meaning end up close together in that space. "washing powder", "detergent" and "Surf Excel" land near each other; "atta" lands somewhere else entirely. You measure closeness with **cosine similarity** (or the closely related cosine distance), which compares the directions of two vectors.
+
+That is what makes "washing powder" find Surf Excel even though they share no words. Two practical points:
+
+- **Pick a multilingual embedding model and test it on your data.** Customers write in Latin, Devanagari and Telugu scripts. Some embedding models handle Indian languages and transliterated text well; many do not. Measure retrieval quality on real queries, as described below.
+- **Embeddings are cheap but not free.** Embedding a product name costs a tiny fraction of an LLM call, and you do it once per product change, not per query. Queries are embedded at search time, which adds a short network call to the latency budget.
+
+## Storing and searching vectors
+
+To find the nearest vectors to a query quickly, databases use **approximate nearest neighbour** (ANN) indexes. The most common today is **HNSW** (Hierarchical Navigable Small World), a layered graph you can walk from coarse to fine to find close neighbours without comparing against every vector. "Approximate" means it might miss a true neighbour occasionally; you trade a little recall for a lot of speed, and you can tune that trade-off.
+
+Here is a fact that simplifies DukaanVoice a lot. **Every catalog search is filtered to one shop**, and an average shop has about 2,000 products. Comparing a query vector against 2,000 vectors exactly is a few milliseconds of work. So for per-shop catalog search, the plan is: use the B-tree index on `shop_id` to fetch that shop's rows, then compute exact distances. No ANN index is needed for this query at all. You need ANN when one search must scan millions of vectors, for example a platform-wide search across all shops.
+
+This matters because filtered ANN search has a well-known trap. If an HNSW index walks the graph first and filters afterwards, a restrictive filter like "only shop X" can leave you with far fewer results than you asked for. pgvector 0.8 added iterative index scans to mitigate this, and dedicated vector databases have their own filtering strategies, but the simplest fix is not to need ANN for filtered per-tenant queries in the first place.
+
+<Callout title="A further optimisation, once you are bigger">
+
+At 50,000 shops with about 2,000 products each, there are around 100 million shop product rows. But most shops sell the same branded goods: Surf Excel 1 kg is Surf Excel 1 kg everywhere. A shared **master catalog** of a few hundred thousand distinct products, embedded once, with each shop's rows pointing at it, cuts the vector count by more than 99%. Shop-specific items (loose rice, local sweets) get their own embeddings.
+
+</Callout>
+
+<Decision id="pgvector-vs-vectordb" />
+
+## What to embed: building the search text
+
+For FAQs and help articles you split documents into **chunks**, pieces small enough to be specific and large enough to be meaningful. Good defaults: split along the document's own structure (one question and answer per chunk for FAQs; a section for help articles), aim for a few hundred tokens, include the title or heading in each chunk so it makes sense on its own, and keep metadata (shop, language, last updated). Arbitrary fixed-size splits that cut a sentence in half are the most common reason RAG retrieves the right document and the wrong paragraph.
+
+For products, each product is one chunk, and the interesting decision is **what text represents it**. The product name alone is too thin. DukaanVoice builds a `search_text` per product:
+
+```text
+Surf Excel Easy Wash detergent powder 1 kg | brand: Surf Excel | category: detergent, washing powder
+| aliases: surf, sarf, surf excel, सर्फ एक्सेल, సర్ఫ్
+```
+
+The aliases come from three sources: the shopkeeper's own entries, transliterations generated once when the product is added, and **phrases customers actually used** in confirmed orders. When a customer says "neeli wali surf" (the blue Surf) and confirms Surf Excel Easy Wash, that phrase can be added as an alias for that shop. Search quality improves from real usage, with no model training.
+
+Notice what is **not** in the search text: price and stock. They change all the time, and you never want a stale embedding to claim a price. They are joined in live from the products table at query time.
+
+## Hybrid search: keywords and vectors together
+
+Vector search is good at meaning and bad at exact names. That is why "Surf Excel" matched Ariel. Keyword search is the opposite: exact on names, useless for "washing powder". **Hybrid search** runs both and combines the results.
+
+For keywords, Postgres gives you two tools:
+
+- **Full-text search** (`tsvector` and `tsquery`) matches words after stemming. Good for English prose, weak on Hinglish spellings.
+- **Trigram matching** with the `pg_trgm` extension compares strings by their three-letter chunks, so "surf exel" is very similar to "surf excel" and "parle g" matches "parle-g". This is the workhorse for brand names and misspellings.
+
+Combining two ranked lists is trickier than it sounds, because their scores are not comparable: a trigram similarity of 0.4 and a cosine distance of 0.2 do not live on the same scale. The standard, robust answer is **reciprocal rank fusion** (RRF). Ignore the raw scores, and give each result a score based on its **rank** in each list:
+
+> score = Σ over lists of 1 ÷ (k + rank), with k usually 60
+
+A product that ranks well in both lists rises to the top; one that ranks first in only one list still scores well. No tuning of score scales is needed.
+
+```sql title="catalog/hybrid-search.sql"
+-- $1 shop_id, $2 query embedding, $3 normalised query text
+WITH vec AS (
+  SELECT id, row_number() OVER (ORDER BY embedding <=> $2) AS r
+  FROM products
+  WHERE shop_id = $1 AND archived_at IS NULL
+  ORDER BY embedding <=> $2 LIMIT 30
+), fuzzy AS (
+  SELECT id, row_number() OVER (ORDER BY word_similarity($3, search_text) DESC) AS r
+  FROM products
+  WHERE shop_id = $1 AND archived_at IS NULL AND $3 <% search_text
+  ORDER BY word_similarity($3, search_text) DESC LIMIT 30
+)
+SELECT p.id, p.name, p.pack_size, p.price_paise, p.stock,      -- live price and stock, never embedded
+       COALESCE(1.0 / (60 + vec.r), 0) + COALESCE(1.0 / (60 + fuzzy.r), 0) AS rrf
+FROM products p
+LEFT JOIN vec ON vec.id = p.id
+LEFT JOIN fuzzy ON fuzzy.id = p.id
+WHERE p.shop_id = $1 AND (vec.id IS NOT NULL OR fuzzy.id IS NOT NULL)
+ORDER BY rrf DESC
+LIMIT 10;
+```
+
+Every branch filters by `shop_id`, and row-level security from lesson 4 enforces it again. A retrieval query without a tenant filter is a data leak, even if the results only ever reach a model.
+
+<Decision id="hybrid-search" />
+
+## Reranking
+
+Hybrid search is good at **recall** (getting the right product somewhere in the top 10). It is less good at **precision** (putting it first). A **reranker** fixes the order. It is a model that looks at the query and each candidate **together** and scores how well they match. This is more accurate than comparing two separately computed embeddings, because the model can attend to details like "1 kg" versus "500 g" or "Gold" versus regular.
+
+Rerankers are slower per item, so you use them only on the short list: retrieve 30 cheaply, rerank to the top 5, send those 5 to the LLM. Dedicated reranker models are fast and cheap; a small LLM can also rerank. Whether reranking is worth its 50 to 150 ms depends on your measurements. For DukaanVoice, it moved the correct product from "in the top 5" to "first" often enough to cut clarifying questions by about a quarter, so it stays.
+
+<Diagram
+  fig="12.1"
+  caption="The query path for catalog search. Cheap, broad retrieval first; an accurate reranker on the short list; live prices joined at the end."
+  label="Catalog retrieval: the query is normalised (quantities, script, spelling). It runs in parallel through trigram keyword search and vector search, both filtered by shop ID. Reciprocal rank fusion merges the two lists into 30 candidates. A reranker picks the top 5. Live price and stock are joined from Postgres, and the 5 results go back to the model as the tool result."
+  chart={`flowchart TD
+  Q["Query: 'neeli wali surf 1 kilo'"] --> N["Normalise: script, quantities, spelling"]
+  N --> K["Trigram search, WHERE shop_id"]
+  N --> V["Vector search, WHERE shop_id"]
+  K --> F["Reciprocal rank fusion: top 30"]
+  V --> F
+  F --> RR["Reranker: top 5"]
+  RR --> J["Join live price and stock"]
+  J --> T["Tool result to the model"]
+`}
+/>
+
+## Metadata filters
+
+Filters are rules applied around the similarity search, and they are where correctness lives:
+
+- **`shop_id` always.** Not usually, always. In the query, and enforced again by row-level security.
+- **Active products only** (`archived_at IS NULL`).
+- **Language or audience** for FAQ chunks, so a Telugu question prefers Telugu answers when they exist.
+
+Some things should be **signals, not filters**. Out-of-stock products are not filtered out of catalog search. If a customer asks for Surf Excel 1 kg and it is out of stock, you want to find it, say so, and offer the 500 g packs. Filtering it out would make the system say "we don't sell that", which is wrong and loses the sale.
+
+## Keeping the index fresh
+
+Products change constantly: new items, renamed items, new aliases. FAQ answers change when a shop changes its delivery area. The index must follow, without slowing down the edit itself.
+
+<Diagram
+  fig="12.2"
+  caption="Indexing runs asynchronously from the outbox. Prices and stock are never embedded, so most edits need no re-embedding at all."
+  label="Indexing pipeline: when a product's name, brand or aliases change, the transaction writes an outbox event. The relay publishes it to an embedding queue. An embedding worker rebuilds the search text, calls the embedding model through the gateway, and updates the vector and the embedding model version on the product row. Price and stock edits do not trigger re-embedding."
+  chart={`flowchart TD
+  E["Shopkeeper edits product"] --> TX["Postgres transaction"]
+  TX --> P[("products row")]
+  TX -->|"name, brand or aliases changed"| OB[("outbox: product.text_changed")]
+  TX -.->|"price or stock only: no event"| P
+  OB --> R["Outbox relay"]
+  R --> EQ[("Embedding queue")]
+  EQ --> EW["Embedding worker"]
+  EW -->|"embed via gateway"| GW["LLM gateway"]
+  EW -->|"update vector and model version"| P
+`}
+/>
+
+The design choices that make this easy:
+
+- **Separate volatile fields from embedded text.** Price and stock live in columns joined at query time, so a price change is instantly correct and costs nothing to "re-index".
+- **Use the outbox from lesson 7** to trigger re-embedding when searchable text changes. The edit returns immediately; the new vector lands a second or two later. Until then the old vector still finds the product by its old name, which is an acceptable lag.
+- **Store the embedding model version** with each vector. Vectors from different embedding models are not comparable. When you upgrade the model, you re-embed everything in a background job, writing to a new column, and switch queries over once it is complete.
+
+## How RAG fails
+
+RAG systems fail in a small number of recognisable ways. Knowing them is half of an interview answer and most of debugging:
+
+1. **Retrieval misses.** The right item is not in the results at all, so the model either guesses or says it cannot help. Fix with better search text, aliases, hybrid search.
+2. **Wrong ranking.** The right item is retrieved but ranked below a similar one. Fix with reranking and better pack-size handling.
+3. **Stale data.** The index or the context says something that is no longer true. Fix by keeping volatile facts out of embeddings and joining them live.
+4. **Cross-tenant leakage.** A missing filter returns another shop's data. Fix with mandatory filters and row-level security, and test it.
+5. **The model ignores the context.** It answers from general knowledge instead of the retrieved data. Fix with instructions to answer only from the provided results, grounding checks (lesson 11), and "I don't know" as an allowed answer.
+6. **Injected instructions in retrieved text.** A shop's FAQ text, or a product name typed by a shopkeeper, contains "ignore your instructions and...". Retrieved text is data, not instructions. Lesson 16 handles this.
+
+### Measure retrieval on its own
+
+When an order comes out wrong, you need to know whether retrieval or generation failed. So evaluate retrieval separately. Build a set of a few hundred real queries, each labelled with the product the customer actually confirmed, and measure **recall@k**: the fraction of queries where the right product appears in the top k results. DukaanVoice tracks recall@5 after reranking (target above 97%) and recall@30 before it (target above 99%). If recall@30 is low, retrieval is the problem. If recall@30 is high but recall@5 is low, ranking is. If both are high and orders are still wrong, look at the model. Lesson 15 builds on this.
+
+## What the architecture looks like now
+
+`searchCatalog` is now a hybrid retrieval pipeline: query normalisation, trigram and vector search filtered by shop, reciprocal rank fusion, a reranker, and live price and stock joins. Products carry a search text with learned aliases. Embeddings live in pgvector next to the data they describe, kept fresh by the outbox and an embedding worker, versioned by embedding model. Shop FAQs are chunked one question per chunk and served through the same machinery. Retrieval has its own metrics, so failures can be blamed on the right stage.
+
+Clarifying questions caused by "product not found" drop by about 70%. Ariel no longer answers for Surf Excel.
+
+## Interview angle
+
+<Interview
+  ask="How would you build product search for natural-language orders with misspellings and brand names?"
+  mistake="Answering “put everything in a vector database”. Pure vector search is weak on exact names and codes, and saying it without mentioning filters, freshness or evaluation is a red flag."
+>
+
+- Hybrid retrieval: keyword or trigram search for names and misspellings, vectors for meaning, fused with reciprocal rank fusion.
+- A reranker on a short candidate list for precision.
+- Mandatory tenant and status filters, with awareness of filtered ANN pitfalls.
+- Volatile data (price, stock) joined live, never embedded; re-embedding triggered by events; embedding model versioning.
+- Retrieval evaluated separately with recall@k, and a list of RAG failure modes.
+
+</Interview>
+
+## Key takeaways
+
+<Takeaways>
+
+- RAG retrieves the few relevant pieces of your data and puts them in context. Most of the engineering is in retrieval, not generation.
+- Hybrid search (trigram or keyword plus vectors, fused with reciprocal rank fusion) beats either alone for brand names and Hinglish spellings; rerank the short list.
+- Filter every query by tenant. For small per-tenant sets, exact search after a B-tree filter is fast and avoids filtered ANN traps.
+- Never embed volatile facts. Join price and stock live, re-embed text changes through the outbox, and version embeddings by model.
+- Measure retrieval separately (recall@k) so you know which stage failed.
+
+</Takeaways>
+
+## Quick self-check
+
+<Quiz
+  questions={[
+    {
+      q: "Pure vector search for “Surf Excel” returns Ariel first. What is the best fix?",
+      options: [
+        "Add trigram or keyword search alongside vectors and fuse the rankings, so exact brand matches rank highly",
+        "Switch to an embedding model with more dimensions",
+        "Lower the similarity threshold so more products are returned",
+        "Remove competing detergent brands from the shop's catalog",
+      ],
+      answer: "A",
+      why: "Embeddings place similar products close together by design, so brand names need a lexical signal. Bigger embeddings do not reliably fix that, a lower threshold returns more noise, and editing the shop's catalog is obviously not an option.",
+    },
+    {
+      q: "Ravi changes the price of Surf Excel. What should happen in the search index?",
+      options: [
+        "Re-embed the product immediately, because the price is part of its search text",
+        "Nothing: price is not embedded, it is joined live from the products table at query time",
+        "Rebuild the whole shop's index overnight",
+        "Invalidate the HNSW index so it is rebuilt on the next query",
+      ],
+      answer: "B",
+      why: "Volatile fields like price and stock are kept out of embedded text and joined at query time, so a price change is instantly correct with no re-indexing. Embedding prices would create exactly the stale-data failures you are trying to avoid.",
+    },
+    {
+      q: "Recall@30 before reranking is 99.5%, but recall@5 after reranking is only 85%. Where is the problem?",
+      options: [
+        "The embedding model, because it is missing products entirely",
+        "The tenant filter, because results are leaking between shops",
+        "Ranking: the right product is retrieved, but the reranker or ordering does not put it near the top",
+        "The LLM, because it ignores the retrieved context",
+      ],
+      answer: "C",
+      why: "High recall at 30 means retrieval finds the product. Low recall at 5 means it is ranked too low, so improve the reranker, pack-size handling or fusion. The LLM has not been involved yet in either metric, and leakage would show up as wrong-shop results, not low recall.",
+    },
+  ]}
+/>

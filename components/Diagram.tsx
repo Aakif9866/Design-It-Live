@@ -30,6 +30,8 @@ const THEMES = {
     signalTextColor: "#1A2332",
     labelBoxBkgColor: "#FFFFFF",
     activationBkgColor: "#E8EEFA",
+    pie1: "#1F4FBF", pie2: "#A86F00", pie3: "#2C7A4B", pie4: "#C2333A", pie5: "#7A8899", pie6: "#8FA6D6",
+    pieStrokeColor: "#FFFFFF", pieOuterStrokeColor: "#1A2332", pieSectionTextColor: "#FFFFFF", pieTitleTextColor: "#1A2332", pieLegendTextColor: "#1A2332",
   },
   dark: {
     darkMode: true,
@@ -59,6 +61,8 @@ const THEMES = {
     signalTextColor: "#E4ECF4",
     labelBoxBkgColor: "#132A4A",
     activationBkgColor: "#183559",
+    pie1: "#7FB2F0", pie2: "#F0B84A", pie3: "#6CCB94", pie4: "#FF8F86", pie5: "#A7B6C8", pie6: "#4F7FB8",
+    pieStrokeColor: "#0E1B2E", pieOuterStrokeColor: "#E4ECF4", pieSectionTextColor: "#0E1B2E", pieTitleTextColor: "#E4ECF4", pieLegendTextColor: "#E4ECF4",
   },
 };
 
